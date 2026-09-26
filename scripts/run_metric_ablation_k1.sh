@@ -26,7 +26,7 @@ export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 
 MODE="${MODE:-sequential}"
 GPU_LIST="${GPU_LIST:-3,4,5,6}"
-RUN_ROOT="${RUN_ROOT:-./exp/scannet/gfsvl_metric_k1_full_bs2}"
+RUN_ROOT="${RUN_ROOT:-./exp/scannet/gfsvl_metric_k1_full_bs12}"
 PYTHON_BIN="${PYTHON_BIN:-/home/xxyu/miniforge3/envs/gfsvl/bin/python}"
 ALLOW_EXISTING="${ALLOW_EXISTING:-0}"
 BATCH_SIZE="${BATCH_SIZE:-12}"
@@ -126,7 +126,12 @@ run_one() {
     } | tee "${launcher_log}"
 
     set +e
-    CUDA_VISIBLE_DEVICES="${gpu}"         "${PYTHON_BIN}" tools/train.py         --config-file "${config}"         --num-gpus 1         --options "${options[@]}"         >> "${launcher_log}" 2>&1
+    CUDA_VISIBLE_DEVICES="${gpu_list}" \
+        "${PYTHON_BIN}" tools/train.py \
+        --config-file "${config}" \
+        --num-gpus "${#GPUS[@]}" \
+        --options "${options[@]}" \
+        >> "${launcher_log}" 2>&1
     local rc=$?
     set -e
 
