@@ -20,6 +20,10 @@ set -Eeuo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT_DIR}"
 
+# Match the official GFS-VL launcher behavior so local package imports
+# (e.g. pointcept) resolve when tools/train.py is executed directly.
+export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
+
 MODE="${MODE:-parallel}"
 GPU_LIST="${GPU_LIST:-0,1,2,3}"
 RUN_ROOT="${RUN_ROOT:-./exp/scannet/gfsvl_metric_k1_full}"
