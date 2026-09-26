@@ -9,7 +9,7 @@ set -Eeuo pipefail
 #   - ScanNet 1-shot
 #   - full 20 epochs
 #   - regis1..regis5
-#   - batch_size=2 and num_worker=2 (validated on a single RTX 4090)
+#   - total batch_size=12 across GPUs 3,4,5,6 (3 samples/GPU)
 #
 # Examples:
 #   bash scripts/run_metric_ablation_k1.sh
@@ -29,8 +29,8 @@ GPU_LIST="${GPU_LIST:-3,4,5,6}"
 RUN_ROOT="${RUN_ROOT:-./exp/scannet/gfsvl_metric_k1_full_bs2}"
 PYTHON_BIN="${PYTHON_BIN:-/home/xxyu/miniforge3/envs/gfsvl/bin/python}"
 ALLOW_EXISTING="${ALLOW_EXISTING:-0}"
-BATCH_SIZE="${BATCH_SIZE:-2}"
-NUM_WORKER="${NUM_WORKER:-2}"
+BATCH_SIZE="${BATCH_SIZE:-12}"
+NUM_WORKER="${NUM_WORKER:-15}"
 
 if [[ "${MODE}" != "parallel" && "${MODE}" != "sequential" ]]; then
     echo "[ERROR] MODE must be 'parallel' or 'sequential', got: ${MODE}" >&2
@@ -58,9 +58,9 @@ CONFIGS=(
     "configs/scannet/semseg-pt-v3m1-0-gfsregistrain_k1-metric-fisher-riemannian.py"
 )
 
-if [[ "${MODE}" == "parallel" && "${#GPUS[@]}" -lt "${#NAMES[@]}" ]]; then
-    echo "[ERROR] Parallel mode needs at least 4 GPU ids." >&2
-    echo "        Current GPU_LIST=${GPU_LIST}" >&2
+if [[ "${MODE}" == "parallel" ]]; then
+    echo "[ERROR] This launcher now targets full-batch DDP runs." >&2
+    echo "        Use MODE=sequential so each metric uses all GPUs in GPU_LIST." >&2
     exit 2
 fi
 
@@ -94,7 +94,7 @@ check_output_dir() {
 
 run_one() {
     local idx="$1"
-    local gpu="$2"
+    local gpu_list="$2"
     local name="${NAMES[$idx]}"
     local config="${CONFIGS[$idx]}"
     local out_dir="${RUN_ROOT}/${name}"
@@ -117,7 +117,7 @@ run_one() {
     {
         echo "============================================================"
         echo "Experiment : ${name}"
-        echo "GPU        : ${gpu}"
+        echo "GPUs       : ${gpu_list}"
         echo "Config     : ${config}"
         echo "Output     : ${out_dir}"
         echo "Start      : $(date '+%F %T')"
@@ -145,9 +145,8 @@ run_one() {
 if [[ "${MODE}" == "sequential" ]]; then
     failed=0
     for i in "${!NAMES[@]}"; do
-        gpu="${GPUS[$(( i % ${#GPUS[@]} ))]}"
-        echo "[LAUNCH] ${NAMES[$i]} on GPU ${gpu}"
-        if ! run_one "${i}" "${gpu}"; then
+        echo "[LAUNCH] ${NAMES[$i]} on GPUs ${GPU_LIST}"
+        if ! run_one "${i}" "${GPU_LIST}"; then
             echo "[FAIL] ${NAMES[$i]}" >&2
             failed=1
         else
