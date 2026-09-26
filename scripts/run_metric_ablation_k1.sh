@@ -9,7 +9,7 @@ set -Eeuo pipefail
 #   - ScanNet 1-shot
 #   - full 20 epochs
 #   - regis1..regis5
-#   - official batch size / workers from the inherited configs
+#   - batch_size=2 and num_worker=2 (validated on a single RTX 4090)
 #
 # Examples:
 #   bash scripts/run_metric_ablation_k1.sh
@@ -26,11 +26,11 @@ export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 
 MODE="${MODE:-sequential}"
 GPU_LIST="${GPU_LIST:-3,4,5,6}"
-RUN_ROOT="${RUN_ROOT:-./exp/scannet/gfsvl_metric_k1_full}"
+RUN_ROOT="${RUN_ROOT:-./exp/scannet/gfsvl_metric_k1_full_bs2}"
 PYTHON_BIN="${PYTHON_BIN:-/home/xxyu/miniforge3/envs/gfsvl/bin/python}"
 ALLOW_EXISTING="${ALLOW_EXISTING:-0}"
-BATCH_SIZE="${BATCH_SIZE:-}"
-NUM_WORKER="${NUM_WORKER:-}"
+BATCH_SIZE="${BATCH_SIZE:-2}"
+NUM_WORKER="${NUM_WORKER:-2}"
 
 if [[ "${MODE}" != "parallel" && "${MODE}" != "sequential" ]]; then
     echo "[ERROR] MODE must be 'parallel' or 'sequential', got: ${MODE}" >&2
@@ -100,7 +100,7 @@ run_one() {
     local out_dir="${RUN_ROOT}/${name}"
     local launcher_log="${out_dir}/launcher.log"
 
-    check_output_dir "${out_dir}"
+    check_output_dir "${out_dir}" || return 1
 
     local -a options
     options=(
@@ -111,12 +111,8 @@ run_one() {
         "num_worker_test=0"
     )
 
-    if [[ -n "${BATCH_SIZE}" ]]; then
-        options+=("batch_size=${BATCH_SIZE}")
-    fi
-    if [[ -n "${NUM_WORKER}" ]]; then
-        options+=("num_worker=${NUM_WORKER}")
-    fi
+    options+=("batch_size=${BATCH_SIZE}")
+    options+=("num_worker=${NUM_WORKER}")
 
     {
         echo "============================================================"
