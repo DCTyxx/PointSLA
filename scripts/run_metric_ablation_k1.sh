@@ -4,8 +4,8 @@ set -Eeuo pipefail
 # Run the four GFS-VL semantic-metric ablations with one command.
 #
 # Default:
-#   - 4 experiments in parallel
-#   - GPUs 0,1,2,3
+#   - 4 experiments sequentially
+#   - GPUs 3,4,5,6 are used in order
 #   - ScanNet 1-shot
 #   - full 20 epochs
 #   - regis1..regis5
@@ -24,8 +24,8 @@ cd "${ROOT_DIR}"
 # (e.g. pointcept) resolve when tools/train.py is executed directly.
 export PYTHONPATH="${ROOT_DIR}:${PYTHONPATH:-}"
 
-MODE="${MODE:-parallel}"
-GPU_LIST="${GPU_LIST:-0,1,2,3}"
+MODE="${MODE:-sequential}"
+GPU_LIST="${GPU_LIST:-3,4,5,6}"
 RUN_ROOT="${RUN_ROOT:-./exp/scannet/gfsvl_metric_k1_full}"
 PYTHON_BIN="${PYTHON_BIN:-/home/xxyu/miniforge3/envs/gfsvl/bin/python}"
 ALLOW_EXISTING="${ALLOW_EXISTING:-0}"
@@ -147,9 +147,9 @@ run_one() {
 }
 
 if [[ "${MODE}" == "sequential" ]]; then
-    gpu="${GPUS[0]}"
     failed=0
     for i in "${!NAMES[@]}"; do
+        gpu="${GPUS[$(( i % ${#GPUS[@]} ))]}"
         echo "[LAUNCH] ${NAMES[$i]} on GPU ${gpu}"
         if ! run_one "${i}" "${gpu}"; then
             echo "[FAIL] ${NAMES[$i]}" >&2
