@@ -23,6 +23,7 @@ from tensorboardX import SummaryWriter
 
 from .defaults import create_ddp_model, worker_init_fn
 from .hooks import HookBase, build_hooks
+from .semantic_metric import SemanticMetricMatcher
 import pointcept.utils.comm as comm
 from pointcept.datasets import build_dataset, point_collate_fn, collate_fn
 from pointcept.models import build_model
@@ -401,6 +402,24 @@ class GFS_VL_Trainer(Trainer):
         if text_embed is not None:
             self.VLM_3D.task_head.set_cls_head_with_text_embed(text_embed)
 
+        # Unified semantic metric used by pseudo-label selection and adaptive
+        # infilling. The default "cosine" exactly recovers the original GFS-VL
+        # matching rule; the other options only change the feature-space metric.
+        self.semantic_metric_matcher = SemanticMetricMatcher(
+            metric=getattr(self.cfg, "semantic_metric", "cosine"),
+            text_embed=text_embed,
+            pca_rank=getattr(self.cfg, "metric_pca_rank", 32),
+            pca_shrinkage=getattr(self.cfg, "metric_pca_shrinkage", 0.1),
+            metric_ridge=getattr(self.cfg, "metric_ridge", 1e-3),
+            fisher_temperature=getattr(
+                self.cfg, "metric_fisher_temperature", 1.0
+            ),
+        )
+        self.logger.info(
+            "=> Semantic matching metric: "
+            f"{self.semantic_metric_matcher.metric}"
+        )
+
         self.VLM_3D.cuda()
         self.VLM_3D.eval()
         # Freeze parameters of the 3D VLM model
@@ -409,43 +428,54 @@ class GFS_VL_Trainer(Trainer):
 
     def extract_3d_vlm_proto(self, regis_val_loader):
         """
-        Compute novel classes prototypes using the 3D VLM.
+        Compute novel-class prototypes using the frozen 3D VLM and, when
+        requested, fit support-set PCA statistics for metric ablations.
         """
         num_novel = self.cfg.data.num_base_novels - self.cfg.data.num_bases
-        average_features = torch.zeros(num_novel, 512, device="cuda")
+        feat_dim = 512
+        average_features = torch.zeros(num_novel, feat_dim, device="cuda")
         class_counts = torch.zeros(num_novel, device="cuda")
 
-        if comm.is_main_process():
-            for input_dict in regis_val_loader:
-                # Transfer all tensor inputs to CUDA
-                for key, value in input_dict.items():
-                    if isinstance(value, torch.Tensor):
-                        input_dict[key] = value.cuda(non_blocking=True)
+        if self.semantic_metric_matcher.needs_support_statistics:
+            self.semantic_metric_matcher.reset_support_statistics(
+                num_classes=num_novel,
+                feat_dim=feat_dim,
+                device=average_features.device,
+            )
 
-                with torch.no_grad():
-                    # Construct input for 3D VLM model and obtain features
-                    data_dict = self.construct_3D_vlm_input(input_dict)
-                    output_dict = self.VLM_3D(data_dict)
-                    vlm_feats = output_dict["all_feats"]
+        # Each process computes the same registration statistics. This keeps
+        # metric state available locally under DDP without serializing large
+        # covariance/factor tensors between ranks.
+        for input_dict in regis_val_loader:
+            for key, value in input_dict.items():
+                if isinstance(value, torch.Tensor):
+                    input_dict[key] = value.cuda(non_blocking=True)
 
-                    # Process each unique class (skip background: -1)
-                    for class_id in input_dict["segment"].unique():
-                        class_id = class_id.item()
-                        if class_id == -1:
-                            continue
-                        assert class_id >= self.cfg.data.num_bases
-                        class_mask = input_dict["segment"] == class_id
-                        class_features = vlm_feats[class_mask]
-                        idx = class_id - self.cfg.data.num_bases
-                        average_features[idx] += class_features.sum(dim=0)
-                        class_counts[idx] += class_features.size(0)
+            with torch.no_grad():
+                data_dict = self.construct_3D_vlm_input(input_dict)
+                output_dict = self.VLM_3D(data_dict)
+                vlm_feats = output_dict["all_feats"]
 
-            # Verify each novel class has at least one sample
-            assert torch.all(class_counts > 0)
-            # Normalize to get the average feature per class
-            average_features = average_features / class_counts.unsqueeze(1)
+                for class_id in input_dict["segment"].unique():
+                    class_id = class_id.item()
+                    if class_id == -1:
+                        continue
+                    assert class_id >= self.cfg.data.num_bases
+                    class_mask = input_dict["segment"] == class_id
+                    class_features = vlm_feats[class_mask]
+                    idx = class_id - self.cfg.data.num_bases
+                    average_features[idx] += class_features.sum(dim=0)
+                    class_counts[idx] += class_features.size(0)
+                    self.semantic_metric_matcher.update_support_statistics(
+                        idx, class_features
+                    )
 
-        # Broadcast the computed prototypes to all processes in distributed training
+        assert torch.all(class_counts > 0)
+        average_features = average_features / class_counts.unsqueeze(1)
+
+        if self.semantic_metric_matcher.needs_support_statistics:
+            self.semantic_metric_matcher.finalize_support_statistics()
+
         if comm.get_world_size() > 1:
             dist.broadcast(average_features, src=0)
         return average_features
@@ -661,12 +691,17 @@ class GFS_VL_Trainer(Trainer):
                     novel_proto = self.vlm_novel_proto[
                         class_id - self.cfg.data.num_bases
                     ]
-                    similarity = torch.cosine_similarity(
-                        proto, novel_proto, dim=0
-                    )
+                    novel_idx = class_id - self.cfg.data.num_bases
+                    similarity = self.semantic_metric_matcher.similarity(
+                        proto,
+                        novel_proto,
+                        class_indices=[novel_idx],
+                    ).squeeze()
                     if similarity < ps_thresh:
                         self.logger.info(
-                            f"=> Filtering class {class_id}, similarity {similarity}"
+                            f"=> Filtering class {class_id}, "
+                            f"metric={self.semantic_metric_matcher.metric}, "
+                            f"similarity {similarity}"
                         )
                         pred_cloud[pred_cloud == class_id] = -1
 
@@ -746,11 +781,13 @@ class GFS_VL_Trainer(Trainer):
                 mask_neg_one = (pred_cloud == -1) & (cur_label == -1)
             feat_neg_one = feat_cloud[mask_neg_one]
 
-            # Compute cosine similarity between these features and the updated prototypes
-            similarities = torch.cosine_similarity(
-                feat_neg_one[:, None, :],
-                updated_prototypes[None, :, :],
-                dim=-1,
+            # Match unlabeled points to updated novel prototypes using the
+            # same metric as pseudo-label selection.
+            metric_class_indices = list(range(len(updated_class_ids)))
+            similarities = self.semantic_metric_matcher.similarity(
+                feat_neg_one,
+                updated_prototypes,
+                class_indices=metric_class_indices,
             )
             max_similarity, max_class_idx = similarities.max(dim=1)
             refined_labels = pred_cloud.clone()
