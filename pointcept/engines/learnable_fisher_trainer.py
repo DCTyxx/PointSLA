@@ -72,7 +72,8 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
             "=> Learnable covariance Fisher enabled: "
             f"params={n_metric}, spectral_rank={matcher.spectral_rank}, "
             f"low_rank={matcher.low_rank}, alpha={matcher.alpha}, eps={matcher.eps}, "
-            f"grad_clip={getattr(self.cfg, 'metric_fisher_grad_clip', 5.0)}"
+            f"grad_clip={getattr(self.cfg, 'metric_fisher_grad_clip', 5.0)}, "
+            "metric_compute=fp32"
         )
 
     def extract_3d_vlm_proto(self, regis_val_loader):
@@ -182,9 +183,16 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
             float(getattr(self.cfg, "metric_fisher_loss_temperature", 1.0)),
             1e-6,
         )
-        logits = matcher.logits(query, temperature=loss_temp)
-        metric_loss = F.cross_entropy(logits, target)
-        geo_reg = matcher.deformation_regularization()
+
+        # Fisher whitening contains inverse variances, square roots and
+        # quadratic forms. These operations have a substantially larger
+        # dynamic range than the segmentation branch and are not safe under
+        # fp16 autocast. Keep the Fisher branch in fp32 even when the main
+        # segmentation network uses AMP.
+        with torch.cuda.amp.autocast(enabled=False):
+            logits = matcher.logits(query.float(), temperature=loss_temp)
+            metric_loss = F.cross_entropy(logits.float(), target)
+            geo_reg = matcher.deformation_regularization().float()
         return metric_loss, geo_reg
 
     def _sync_fisher_gradients(self):
@@ -198,8 +206,21 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
                 )
                 param.grad.div_(world)
 
+    def _fisher_gradients_finite(self):
+        """Return one DDP-consistent finite/non-finite decision."""
+        device = next(self.semantic_metric_matcher.parameters()).device
+        finite = torch.ones((), device=device, dtype=torch.int32)
+        for param in self.semantic_metric_matcher.parameters():
+            if param.requires_grad and param.grad is not None:
+                if not torch.isfinite(param.grad).all():
+                    finite.zero_()
+                    break
+        if comm.get_world_size() > 1:
+            torch.distributed.all_reduce(finite, op=torch.distributed.ReduceOp.MIN)
+        return bool(finite.item())
+
     def _clip_fisher_gradients(self):
-        """Clip only learnable Fisher gradients after DDP averaging."""
+        """Clip only finite learnable Fisher gradients after DDP averaging."""
         max_norm = float(getattr(self.cfg, "metric_fisher_grad_clip", 5.0))
         if max_norm <= 0:
             return None
@@ -211,6 +232,14 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         if not params:
             return None
         return torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
+
+    def _handle_nonfinite_fisher_gradients(self):
+        """Skip a contaminated optimizer step before NaNs reach parameters."""
+        self.logger.warning(
+            "=> Non-finite Learnable Fisher gradient detected after DDP sync; "
+            "skipping this optimizer step."
+        )
+        self.optimizer.zero_grad(set_to_none=True)
 
     def run_step(self):
         input_dict = self.comm_info["input_dict"]
@@ -231,6 +260,7 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
                 else self.model.criteria
             )
             seg_loss = criteria(seg_logits, new_target)
+            # _compute_metric_loss explicitly disables autocast internally.
             metric_loss, geo_reg = self._compute_metric_loss(input_dict)
 
             metric_weight = float(
@@ -249,9 +279,21 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         if self.cfg.enable_amp:
             self.scaler.scale(loss).backward()
             # Fisher is not wrapped by DDP. Unscale first, average its true
-            # gradients across ranks, then clip the averaged Fisher gradient.
+            # gradients across ranks, verify finiteness, then clip.
             self.scaler.unscale_(self.optimizer)
             self._sync_fisher_gradients()
+            if not self._fisher_gradients_finite():
+                self._handle_nonfinite_fisher_gradients()
+                # Keep all ranks on the same conservative loss scale. We have
+                # already called unscale_, so explicitly reduce the scale and
+                # do not execute optimizer.step() or scheduler.step().
+                new_scale = max(float(self.scaler.get_scale()) * 0.5, 1.0)
+                self.scaler.update(new_scale=new_scale)
+                if self.cfg.empty_cache:
+                    torch.cuda.empty_cache()
+                self.comm_info["model_output_dict"] = output_dict
+                return
+
             self._clip_fisher_gradients()
             self.scaler.step(self.optimizer)
             old_scale = self.scaler.get_scale()
@@ -261,6 +303,12 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         else:
             loss.backward()
             self._sync_fisher_gradients()
+            if not self._fisher_gradients_finite():
+                self._handle_nonfinite_fisher_gradients()
+                if self.cfg.empty_cache:
+                    torch.cuda.empty_cache()
+                self.comm_info["model_output_dict"] = output_dict
+                return
             self._clip_fisher_gradients()
             self.optimizer.step()
             self.scheduler.step()
