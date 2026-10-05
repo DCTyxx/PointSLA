@@ -12,9 +12,8 @@ class LearnableCovarianceFisher(nn.Module):
         A_c    = h_theta(mu_c, Lambda_c, R_c).
 
     For efficiency, G_c^F is represented by a rank-m eigenspace plus an
-    isotropic residual precision. The learned deformation acts in the retained
-    Fisher-normalized subspace. This preserves the intended geometry while
-    avoiding dense D x D transforms for every query point.
+    isotropic residual precision. The learned deformation acts on the resulting
+    approximate G_c^{F/2}, avoiding dense D x D transforms for every query.
     """
 
     def __init__(
@@ -62,8 +61,8 @@ class LearnableCovarianceFisher(nn.Module):
             nn.Linear(self.hidden_dim, self.feat_dim * self.low_rank),
         )
 
-        # A=0 is a stationary point of A A^T. A tiny non-zero initialization
-        # makes the initial geometry practically fixed Fisher but trainable.
+        # A=0 is a stationary point of A A^T. Tiny non-zero initialization
+        # keeps the initial geometry practically fixed Fisher but trainable.
         nn.init.normal_(self.generator[-1].weight, mean=0.0, std=self.init_scale)
         nn.init.normal_(self.generator[-1].bias, mean=0.0, std=self.init_scale)
 
@@ -175,7 +174,10 @@ class LearnableCovarianceFisher(nn.Module):
         mu_desc = self.mu_encoder(F.normalize(mu, dim=-1))
         residual_var = (1.0 / residual_prec.clamp_min(1e-12)) - self.eps
         spectrum = torch.cat(
-            [torch.log(lam + self.eps), torch.log(residual_var[:, None] + self.eps)],
+            [
+                torch.log(lam + self.eps),
+                torch.log(residual_var[:, None].clamp_min(0.0) + self.eps),
+            ],
             dim=-1,
         )
         spec_desc = self.spectrum_encoder(spectrum)
@@ -206,6 +208,7 @@ class LearnableCovarianceFisher(nn.Module):
             delta = q - means[c]
             U = bases[c]
             lam = evals[c]
+            rho = residual_precs[c]
 
             coeff = delta @ U
             whitened = coeff / torch.sqrt(lam + self.eps)
@@ -214,12 +217,19 @@ class LearnableCovarianceFisher(nn.Module):
             delta_norm = delta.square().sum(dim=-1)
             projected_norm = coeff.square().sum(dim=-1)
             residual_norm = (delta_norm - projected_norm).clamp_min(0.0)
-            fixed_fisher = retained + residual_precs[c] * residual_norm
+            fixed_fisher = retained + rho * residual_norm
 
-            # Project the feature-space deformation into the retained Fisher
-            # eigenspace; sign flips of U cancel between whitened and U^T A.
+            # Efficiently evaluate y A where
+            # y = delta G_F^{1/2}
+            #   = whitened U^T + sqrt(rho) delta (I-UU^T).
+            # This includes both retained and isotropic residual subspaces
+            # without forming a dense D x D Fisher square root.
             A_sub = U.transpose(0, 1) @ A[c]
-            learned_residual = (whitened @ A_sub).square().sum(dim=-1)
+            retained_A = whitened @ A_sub
+            residual_A = delta @ A[c] - coeff @ A_sub
+            fisher_half_A = retained_A + torch.sqrt(rho) * residual_A
+            learned_residual = fisher_half_A.square().sum(dim=-1)
+
             all_dist.append(fixed_fisher + self.alpha * learned_residual)
 
         return torch.stack(all_dist, dim=1)
