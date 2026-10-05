@@ -35,6 +35,9 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
 
         matcher = LearnableCovarianceFisher(
             feat_dim=int(getattr(self.cfg, "metric_fisher_feat_dim", 512)),
+            spectral_rank=int(
+                getattr(self.cfg, "metric_fisher_spectral_rank", 32)
+            ),
             low_rank=int(getattr(self.cfg, "metric_fisher_low_rank", 8)),
             hidden_dim=int(getattr(self.cfg, "metric_fisher_hidden_dim", 128)),
             alpha=float(getattr(self.cfg, "metric_fisher_alpha", 0.25)),
@@ -67,8 +70,8 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         n_metric = sum(p.numel() for p in metric_params)
         self.logger.info(
             "=> Learnable covariance Fisher enabled: "
-            f"params={n_metric}, low_rank={matcher.low_rank}, "
-            f"alpha={matcher.alpha}, eps={matcher.eps}"
+            f"params={n_metric}, spectral_rank={matcher.spectral_rank}, "
+            f"low_rank={matcher.low_rank}, alpha={matcher.alpha}, eps={matcher.eps}"
         )
 
     def extract_3d_vlm_proto(self, regis_val_loader):
@@ -123,6 +126,7 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         self.logger.info(
             "=> Support Fisher statistics ready: "
             f"classes={num_novel}, counts={counts.tolist()}, "
+            f"rank={diag['spectral_rank']}, "
             f"A_rms={diag['a_rms']:.6f}, A_max={diag['a_max']:.6f}"
         )
         return average_features
