@@ -10,12 +10,12 @@ import pointcept.utils.comm as comm
 class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
     """GFS-VL trainer for support-conditioned Learnable Fisher-Riemannian geometry.
 
-    The frozen 3D VLM supplies support/query features.  For each registration
+    The frozen 3D VLM supplies support/query features. For each registration
     episode we estimate class moments and build
 
         G_c^F = (Sigma_c + eps I)^(-1).
 
-    A lightweight generator then predicts
+    A lightweight generator predicts
 
         A_c = h_theta(mu_c, Lambda_c, R_c)
 
@@ -105,8 +105,8 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
                     counts[idx] += class_features.shape[0]
 
         if comm.get_world_size() > 1:
-            # Every rank normally scans the same registration set. Keep the
-            # statistics rank-local to avoid multiplying counts by world size.
+            # Every rank scans the same registration set. Broadcast rank-0
+            # moments so all ranks use exactly the same Fisher geometry.
             torch.distributed.broadcast(sums, src=0)
             torch.distributed.broadcast(outers, src=0)
             torch.distributed.broadcast(counts, src=0)
@@ -199,8 +199,8 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
             if isinstance(value, torch.Tensor):
                 input_dict[key] = value.cuda(non_blocking=True)
 
-        # Parent calibration now calls the covariance-Fisher compatibility API,
-        # so both pseudo-label selection and adaptive infilling use G_c^LF.
+        # Parent calibration calls the covariance-Fisher compatibility API, so
+        # pseudo-label selection and adaptive infilling both use G_c^LF.
         new_target = self.target_calibrate(input_dict)
 
         with torch.cuda.amp.autocast(enabled=self.cfg.enable_amp):
@@ -229,6 +229,10 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         self.optimizer.zero_grad()
         if self.cfg.enable_amp:
             self.scaler.scale(loss).backward()
+            # Fisher is not wrapped by DDP. Unscale before manually averaging
+            # its gradients across ranks; otherwise rank-dependent AMP scales
+            # would corrupt the synchronization.
+            self.scaler.unscale_(self.optimizer)
             self._sync_fisher_gradients()
             self.scaler.step(self.optimizer)
             old_scale = self.scaler.get_scale()
