@@ -71,7 +71,8 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         self.logger.info(
             "=> Learnable covariance Fisher enabled: "
             f"params={n_metric}, spectral_rank={matcher.spectral_rank}, "
-            f"low_rank={matcher.low_rank}, alpha={matcher.alpha}, eps={matcher.eps}"
+            f"low_rank={matcher.low_rank}, alpha={matcher.alpha}, eps={matcher.eps}, "
+            f"grad_clip={getattr(self.cfg, 'metric_fisher_grad_clip', 5.0)}"
         )
 
     def extract_3d_vlm_proto(self, regis_val_loader):
@@ -197,6 +198,20 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
                 )
                 param.grad.div_(world)
 
+    def _clip_fisher_gradients(self):
+        """Clip only learnable Fisher gradients after DDP averaging."""
+        max_norm = float(getattr(self.cfg, "metric_fisher_grad_clip", 5.0))
+        if max_norm <= 0:
+            return None
+        params = [
+            p
+            for p in self.semantic_metric_matcher.parameters()
+            if p.requires_grad and p.grad is not None
+        ]
+        if not params:
+            return None
+        return torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
+
     def run_step(self):
         input_dict = self.comm_info["input_dict"]
         for key, value in input_dict.items():
@@ -233,11 +248,11 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         self.optimizer.zero_grad()
         if self.cfg.enable_amp:
             self.scaler.scale(loss).backward()
-            # Fisher is not wrapped by DDP. Unscale before manually averaging
-            # its gradients across ranks; otherwise rank-dependent AMP scales
-            # would corrupt the synchronization.
+            # Fisher is not wrapped by DDP. Unscale first, average its true
+            # gradients across ranks, then clip the averaged Fisher gradient.
             self.scaler.unscale_(self.optimizer)
             self._sync_fisher_gradients()
+            self._clip_fisher_gradients()
             self.scaler.step(self.optimizer)
             old_scale = self.scaler.get_scale()
             self.scaler.update()
@@ -246,6 +261,7 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         else:
             loss.backward()
             self._sync_fisher_gradients()
+            self._clip_fisher_gradients()
             self.optimizer.step()
             self.scheduler.step()
 
