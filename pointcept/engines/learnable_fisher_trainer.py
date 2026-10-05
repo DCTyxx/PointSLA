@@ -10,11 +10,11 @@ import pointcept.utils.comm as comm
 class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
     """GFS-VL trainer with a task-learnable Fisher-Riemannian matcher.
 
-    The 3D VLM remains frozen.  Only a lightweight semantic-space deformation
-    of the Fisher pullback metric is learned, jointly with the original
-    segmentation model.  The learnable metric is supervised by point labels on
-    the available novel-class points, so no router or additional backbone is
-    introduced.
+    The 3D VLM remains frozen. Only a lightweight semantic-space deformation
+    of the Fisher pullback metric is learned jointly with the original
+    segmentation model. The metric head is training-only: it changes
+    pseudo-label calibration and receives its own task loss, while the final
+    segmentation network and inference path remain unchanged.
     """
 
     def build_zero_shot_model(self):
@@ -44,18 +44,14 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         ).cuda()
         self.semantic_metric_matcher = matcher
 
-        # Attach the matcher to the segmentation module so its state is included
-        # in normal checkpoints.  DDP was constructed before this attachment,
-        # therefore Fisher gradients are synchronized explicitly below.
-        model_ref = self.model.module if comm.get_world_size() > 1 else self.model
-        model_ref.learnable_fisher = matcher
-
+        # The trainer is constructed after the segmentation optimizer, so add
+        # only the Fisher parameters as a dedicated optimization group.  The
+        # matcher is intentionally not attached to the segmentation model:
+        # inference therefore keeps the exact original GFS-VL architecture.
         metric_params = [p for p in matcher.parameters() if p.requires_grad]
         if metric_params:
             base_lr = self.optimizer.param_groups[0]["lr"]
-            fisher_lr = float(
-                getattr(self.cfg, "metric_fisher_lr", base_lr)
-            )
+            fisher_lr = float(getattr(self.cfg, "metric_fisher_lr", base_lr))
             fisher_weight_decay = float(
                 getattr(self.cfg, "metric_fisher_weight_decay", 0.0)
             )
@@ -77,7 +73,7 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
     def pseudo_label_selection(
         self, all_pred_cloud, all_feat_cloud, offset, ps_thresh=0.6
     ):
-        # target_calibrate() executes under torch.no_grad().  Cache the frozen
+        # target_calibrate() executes under torch.no_grad(). Cache the frozen
         # VLM features here and train only the Fisher matcher afterwards.
         self._metric_train_features = all_feat_cloud.detach()
         return super().pseudo_label_selection(
@@ -152,7 +148,7 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
                 input_dict[key] = value.cuda(non_blocking=True)
 
         # The original hard pseudo-label path stays unchanged and uses the
-        # current Fisher geometry.  Frozen VLM features are cached by the
+        # current Fisher geometry. Frozen VLM features are cached by the
         # overridden pseudo_label_selection().
         new_target = self.target_calibrate(input_dict)
 
