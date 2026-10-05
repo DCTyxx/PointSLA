@@ -103,6 +103,11 @@ class RegisTrainSegmentor(nn.Module):
         self.backbone = build_model(backbone)
         self.criteria = build_criteria(criteria)
 
+    def getFeatures(self, input_dict):
+        """Return trainable point-wise backbone features before segmentation heads."""
+        point = Point(input_dict)
+        point = self.backbone(point)
+        return point.feat if isinstance(point, Point) else point
 
     def forward(self, input_dict):
         point = Point(input_dict)
@@ -118,16 +123,21 @@ class RegisTrainSegmentor(nn.Module):
         novel_seg_logits = self.novel_seg_head(feat)
         seg_logits = torch.cat([base_seg_logits, novel_seg_logits], dim=1)
 
+        # Expose the pre-head feature so auxiliary geometric objectives can
+        # regularize the point-cloud backbone directly. This tensor is not
+        # detached: gradients from such objectives flow into the backbone.
+        output = dict(seg_logits=seg_logits, backbone_feat=feat)
+
         # train
         if self.training:
-            return dict(seg_logits=seg_logits)
+            return output
         # eval
         elif "segment" in input_dict.keys():
-            loss = self.criteria(seg_logits, input_dict["segment"])
-            return dict(loss=loss, seg_logits=seg_logits)
+            output["loss"] = self.criteria(seg_logits, input_dict["segment"])
+            return output
         # test
         else:
-            return dict(seg_logits=seg_logits)
+            return output
 
 
 
