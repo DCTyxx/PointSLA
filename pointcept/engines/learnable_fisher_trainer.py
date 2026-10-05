@@ -8,7 +8,7 @@ import pointcept.utils.comm as comm
 
 @TRAINERS.register_module("GFS_VL_LearnableFisher_Trainer")
 class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
-    """GFS-VL trainer for support-conditioned Learnable Fisher-Riemannian geometry.
+    """GFS-VL trainer with decoupled Learnable Fisher metric learning.
 
     The frozen 3D VLM supplies support/query features. For each registration
     episode we estimate class moments and build
@@ -23,12 +23,17 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
 
         G_c^LF = G_c^{F/2}(I + alpha A_c A_c^T)G_c^{F/2}.
 
-    The VLM remains frozen. Only the low-rank geometry generator and the
-    segmentation network are optimized.
+    In this ablation, Learnable Fisher is optimized only through its auxiliary
+    metric loss. Pseudo-label selection and adaptive infilling keep using the
+    original semantic metric configured by ``semantic_metric`` (cosine here),
+    so the learned Fisher metric cannot hard-filter novel pseudo labels.
     """
 
     def build_zero_shot_model(self):
+        # Build the original GFS-VL semantic matcher first. With the current
+        # config this is cosine and remains the calibration/infilling metric.
         super().build_zero_shot_model()
+        self.learnable_fisher_matcher = None
 
         if not bool(getattr(self.cfg, "metric_fisher_learnable", True)):
             return
@@ -49,7 +54,7 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
                 getattr(self.cfg, "metric_fisher_match_temperature", 1.0)
             ),
         ).cuda()
-        self.semantic_metric_matcher = matcher
+        self.learnable_fisher_matcher = matcher
 
         metric_params = [p for p in matcher.parameters() if p.requires_grad]
         if metric_params:
@@ -69,15 +74,15 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
 
         n_metric = sum(p.numel() for p in metric_params)
         self.logger.info(
-            "=> Learnable covariance Fisher enabled: "
+            "=> Learnable covariance Fisher enabled as auxiliary metric learner: "
             f"params={n_metric}, spectral_rank={matcher.spectral_rank}, "
             f"low_rank={matcher.low_rank}, alpha={matcher.alpha}, eps={matcher.eps}, "
             f"grad_clip={getattr(self.cfg, 'metric_fisher_grad_clip', 5.0)}, "
-            "metric_compute=fp32"
+            f"metric_compute=fp32, calibration_metric={self.semantic_metric_matcher.metric}"
         )
 
     def extract_3d_vlm_proto(self, regis_val_loader):
-        """Estimate support prototypes and class covariance moments."""
+        """Estimate cosine prototypes plus support moments for Learnable Fisher."""
         num_novel = self.cfg.data.num_base_novels - self.cfg.data.num_bases
         feat_dim = int(getattr(self.cfg, "metric_fisher_feat_dim", 512))
         sums = torch.zeros(num_novel, feat_dim, device="cuda", dtype=torch.float32)
@@ -85,6 +90,13 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
             num_novel, feat_dim, feat_dim, device="cuda", dtype=torch.float32
         )
         counts = torch.zeros(num_novel, device="cuda", dtype=torch.long)
+
+        # Keep compatibility with any calibration metric that needs support
+        # statistics. For cosine this is a no-op.
+        if getattr(self.semantic_metric_matcher, "needs_support_statistics", False):
+            self.semantic_metric_matcher.reset_support_statistics(
+                num_novel, feat_dim, torch.device("cuda")
+            )
 
         for input_dict in regis_val_loader:
             for key, value in input_dict.items():
@@ -105,9 +117,19 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
                     class_features = vlm_feats[input_dict["segment"] == class_id]
                     if class_features.numel() == 0:
                         continue
+
                     sums[idx] += class_features.sum(dim=0)
                     outers[idx] += class_features.transpose(0, 1) @ class_features
                     counts[idx] += class_features.shape[0]
+
+                    if getattr(
+                        self.semantic_metric_matcher,
+                        "needs_support_statistics",
+                        False,
+                    ):
+                        self.semantic_metric_matcher.update_support_statistics(
+                            idx, class_features
+                        )
 
         if comm.get_world_size() > 1:
             # Every rank scans the same registration set. Broadcast rank-0
@@ -120,24 +142,32 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
             missing = torch.nonzero(counts <= 0, as_tuple=False).flatten().tolist()
             raise RuntimeError(f"Missing support statistics for novel classes: {missing}")
 
+        if getattr(self.semantic_metric_matcher, "needs_support_statistics", False):
+            self.semantic_metric_matcher.finalize_support_statistics()
+
         average_features = sums / counts.to(sums.dtype).unsqueeze(1)
-        self.semantic_metric_matcher.prepare_support_from_moments(
-            sums, outers, counts
-        )
-        diag = self.semantic_metric_matcher.diagnostics()
-        self.logger.info(
-            "=> Support Fisher statistics ready: "
-            f"classes={num_novel}, counts={counts.tolist()}, "
-            f"rank={diag['spectral_rank']}, "
-            f"A_rms={diag['a_rms']:.6f}, A_max={diag['a_max']:.6f}"
-        )
+
+        matcher = self.learnable_fisher_matcher
+        if isinstance(matcher, LearnableCovarianceFisher):
+            matcher.prepare_support_from_moments(sums, outers, counts)
+            diag = matcher.diagnostics()
+            self.logger.info(
+                "=> Support Fisher statistics ready: "
+                f"classes={num_novel}, counts={counts.tolist()}, "
+                f"rank={diag['spectral_rank']}, "
+                f"A_rms={diag['a_rms']:.6f}, A_max={diag['a_max']:.6f}; "
+                f"pseudo_label_metric={self.semantic_metric_matcher.metric}"
+            )
+
         return average_features
 
     def pseudo_label_selection(
         self, all_pred_cloud, all_feat_cloud, offset, ps_thresh=0.6
     ):
         # target_calibrate() runs under no_grad. Cache frozen VLM features for
-        # the differentiable Fisher metric loss computed afterwards.
+        # the differentiable Fisher metric loss computed afterwards. The parent
+        # selection itself uses self.semantic_metric_matcher, which remains the
+        # original cosine matcher in this ablation.
         self._metric_train_features = all_feat_cloud.detach()
         return super().pseudo_label_selection(
             all_pred_cloud,
@@ -164,7 +194,7 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         return query, target
 
     def _compute_metric_loss(self, input_dict):
-        matcher = self.semantic_metric_matcher
+        matcher = self.learnable_fisher_matcher
         if not isinstance(matcher, LearnableCovarianceFisher):
             zero = self.vlm_novel_proto.new_zeros(())
             return zero, zero
@@ -185,9 +215,7 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         )
 
         # Fisher whitening contains inverse variances, square roots and
-        # quadratic forms. These operations have a substantially larger
-        # dynamic range than the segmentation branch and are not safe under
-        # fp16 autocast. Keep the Fisher branch in fp32 even when the main
+        # quadratic forms. Keep the Fisher branch in fp32 even when the main
         # segmentation network uses AMP.
         with torch.cuda.amp.autocast(enabled=False):
             logits = matcher.logits(query.float(), temperature=loss_temp)
@@ -195,40 +223,46 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
             geo_reg = matcher.deformation_regularization().float()
         return metric_loss, geo_reg
 
+    def _fisher_parameters_with_grad(self):
+        matcher = self.learnable_fisher_matcher
+        if matcher is None:
+            return []
+        return [
+            p for p in matcher.parameters() if p.requires_grad and p.grad is not None
+        ]
+
     def _sync_fisher_gradients(self):
-        if comm.get_world_size() <= 1:
+        params = self._fisher_parameters_with_grad()
+        if comm.get_world_size() <= 1 or not params:
             return
         world = float(comm.get_world_size())
-        for param in self.semantic_metric_matcher.parameters():
-            if param.requires_grad and param.grad is not None:
-                torch.distributed.all_reduce(
-                    param.grad, op=torch.distributed.ReduceOp.SUM
-                )
-                param.grad.div_(world)
+        for param in params:
+            torch.distributed.all_reduce(
+                param.grad, op=torch.distributed.ReduceOp.SUM
+            )
+            param.grad.div_(world)
 
     def _fisher_gradients_finite(self):
         """Return one DDP-consistent finite/non-finite decision."""
-        device = next(self.semantic_metric_matcher.parameters()).device
+        matcher = self.learnable_fisher_matcher
+        if matcher is None:
+            return True
+        device = next(matcher.parameters()).device
         finite = torch.ones((), device=device, dtype=torch.int32)
-        for param in self.semantic_metric_matcher.parameters():
-            if param.requires_grad and param.grad is not None:
-                if not torch.isfinite(param.grad).all():
-                    finite.zero_()
-                    break
+        for param in self._fisher_parameters_with_grad():
+            if not torch.isfinite(param.grad).all():
+                finite.zero_()
+                break
         if comm.get_world_size() > 1:
             torch.distributed.all_reduce(finite, op=torch.distributed.ReduceOp.MIN)
         return bool(finite.item())
 
     def _clip_fisher_gradients(self):
-        """Clip only finite learnable Fisher gradients after DDP averaging."""
+        """Clip only finite Learnable Fisher gradients after DDP averaging."""
         max_norm = float(getattr(self.cfg, "metric_fisher_grad_clip", 5.0))
         if max_norm <= 0:
             return None
-        params = [
-            p
-            for p in self.semantic_metric_matcher.parameters()
-            if p.requires_grad and p.grad is not None
-        ]
+        params = self._fisher_parameters_with_grad()
         if not params:
             return None
         return torch.nn.utils.clip_grad_norm_(params, max_norm=max_norm)
@@ -247,8 +281,9 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
             if isinstance(value, torch.Tensor):
                 input_dict[key] = value.cuda(non_blocking=True)
 
-        # Parent calibration calls the covariance-Fisher compatibility API, so
-        # pseudo-label selection and adaptive infilling both use G_c^LF.
+        # Pseudo-label selection and adaptive infilling use the original
+        # semantic matcher (cosine in this config). Learnable Fisher is fully
+        # decoupled from the hard pseudo-label decisions in this ablation.
         new_target = self.target_calibrate(input_dict)
 
         with torch.cuda.amp.autocast(enabled=self.cfg.enable_amp):
@@ -284,9 +319,6 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
             self._sync_fisher_gradients()
             if not self._fisher_gradients_finite():
                 self._handle_nonfinite_fisher_gradients()
-                # Keep all ranks on the same conservative loss scale. We have
-                # already called unscale_, so explicitly reduce the scale and
-                # do not execute optimizer.step() or scheduler.step().
                 new_scale = max(float(self.scaler.get_scale()) * 0.5, 1.0)
                 self.scaler.update(new_scale=new_scale)
                 if self.cfg.empty_cache:
