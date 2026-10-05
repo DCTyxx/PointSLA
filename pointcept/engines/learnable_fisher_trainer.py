@@ -1,53 +1,53 @@
 import torch
 import torch.nn.functional as F
 
-from .learnable_fisher import LearnableFisherRiemannianMatcher
+from .learnable_fisher import LearnableCovarianceFisher
 from .train import GFS_VL_Trainer, TRAINERS
 import pointcept.utils.comm as comm
 
 
 @TRAINERS.register_module("GFS_VL_LearnableFisher_Trainer")
 class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
-    """GFS-VL trainer with a task-learnable Fisher-Riemannian matcher.
+    """GFS-VL trainer for support-conditioned Learnable Fisher-Riemannian geometry.
 
-    The 3D VLM remains frozen. Only a lightweight semantic-space deformation
-    of the Fisher pullback metric is learned jointly with the original
-    segmentation model. The metric head is training-only: it changes
-    pseudo-label calibration and receives its own task loss, while the final
-    segmentation network and inference path remain unchanged.
+    The frozen 3D VLM supplies support/query features.  For each registration
+    episode we estimate class moments and build
+
+        G_c^F = (Sigma_c + eps I)^(-1).
+
+    A lightweight generator then predicts
+
+        A_c = h_theta(mu_c, Lambda_c, R_c)
+
+    and deforms the Fisher-normalized geometry as
+
+        G_c^LF = G_c^{F/2}(I + alpha A_c A_c^T)G_c^{F/2}.
+
+    The VLM remains frozen. Only the low-rank geometry generator and the
+    segmentation network are optimized.
     """
 
     def build_zero_shot_model(self):
         super().build_zero_shot_model()
 
-        enabled = bool(getattr(self.cfg, "metric_fisher_learnable", False))
-        if self.semantic_metric_matcher.metric != "fisher_riemannian" or not enabled:
+        if not bool(getattr(self.cfg, "metric_fisher_learnable", True)):
             return
 
-        frozen_text = self.semantic_metric_matcher.text_embed
-        matcher = LearnableFisherRiemannianMatcher(
-            text_embed=frozen_text,
-            metric_ridge=getattr(self.cfg, "metric_ridge", 1e-3),
-            fisher_temperature=getattr(
-                self.cfg, "metric_fisher_temperature", 1.0
-            ),
-            hidden_dim=getattr(self.cfg, "metric_fisher_hidden_dim", 32),
-            residual_scale=getattr(
-                self.cfg, "metric_fisher_residual_scale", 0.25
-            ),
-            learn_temperature=getattr(
-                self.cfg, "metric_fisher_learn_temperature", True
-            ),
-            max_log_weight=getattr(
-                self.cfg, "metric_fisher_max_log_weight", 2.0
+        matcher = LearnableCovarianceFisher(
+            feat_dim=int(getattr(self.cfg, "metric_fisher_feat_dim", 512)),
+            low_rank=int(getattr(self.cfg, "metric_fisher_low_rank", 8)),
+            hidden_dim=int(getattr(self.cfg, "metric_fisher_hidden_dim", 128)),
+            alpha=float(getattr(self.cfg, "metric_fisher_alpha", 0.25)),
+            eps=float(getattr(self.cfg, "metric_fisher_eps", 1e-3)),
+            shrinkage=float(getattr(self.cfg, "metric_fisher_shrinkage", 0.1)),
+            relation_topk=int(getattr(self.cfg, "metric_fisher_relation_topk", 3)),
+            init_scale=float(getattr(self.cfg, "metric_fisher_init_scale", 1e-3)),
+            match_temperature=float(
+                getattr(self.cfg, "metric_fisher_match_temperature", 1.0)
             ),
         ).cuda()
         self.semantic_metric_matcher = matcher
 
-        # The trainer is constructed after the segmentation optimizer, so add
-        # only the Fisher parameters as a dedicated optimization group.  The
-        # matcher is intentionally not attached to the segmentation model:
-        # inference therefore keeps the exact original GFS-VL architecture.
         metric_params = [p for p in matcher.parameters() if p.requires_grad]
         if metric_params:
             base_lr = self.optimizer.param_groups[0]["lr"]
@@ -64,17 +64,74 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
                 }
             )
 
+        n_metric = sum(p.numel() for p in metric_params)
         self.logger.info(
-            "=> Learnable Fisher enabled: "
-            f"{matcher.parameter_summary()}, "
-            f"loss_weight={getattr(self.cfg, 'metric_fisher_loss_weight', 0.1)}"
+            "=> Learnable covariance Fisher enabled: "
+            f"params={n_metric}, low_rank={matcher.low_rank}, "
+            f"alpha={matcher.alpha}, eps={matcher.eps}"
         )
+
+    def extract_3d_vlm_proto(self, regis_val_loader):
+        """Estimate support prototypes and class covariance moments."""
+        num_novel = self.cfg.data.num_base_novels - self.cfg.data.num_bases
+        feat_dim = int(getattr(self.cfg, "metric_fisher_feat_dim", 512))
+        sums = torch.zeros(num_novel, feat_dim, device="cuda", dtype=torch.float32)
+        outers = torch.zeros(
+            num_novel, feat_dim, feat_dim, device="cuda", dtype=torch.float32
+        )
+        counts = torch.zeros(num_novel, device="cuda", dtype=torch.long)
+
+        for input_dict in regis_val_loader:
+            for key, value in input_dict.items():
+                if isinstance(value, torch.Tensor):
+                    input_dict[key] = value.cuda(non_blocking=True)
+
+            with torch.no_grad():
+                data_dict = self.construct_3D_vlm_input(input_dict)
+                output_dict = self.VLM_3D(data_dict)
+                vlm_feats = output_dict["all_feats"].float()
+
+                for class_id in input_dict["segment"].unique():
+                    class_id = int(class_id.item())
+                    if class_id == -1:
+                        continue
+                    assert class_id >= self.cfg.data.num_bases
+                    idx = class_id - self.cfg.data.num_bases
+                    class_features = vlm_feats[input_dict["segment"] == class_id]
+                    if class_features.numel() == 0:
+                        continue
+                    sums[idx] += class_features.sum(dim=0)
+                    outers[idx] += class_features.transpose(0, 1) @ class_features
+                    counts[idx] += class_features.shape[0]
+
+        if comm.get_world_size() > 1:
+            # Every rank normally scans the same registration set. Keep the
+            # statistics rank-local to avoid multiplying counts by world size.
+            torch.distributed.broadcast(sums, src=0)
+            torch.distributed.broadcast(outers, src=0)
+            torch.distributed.broadcast(counts, src=0)
+
+        if not torch.all(counts > 0):
+            missing = torch.nonzero(counts <= 0, as_tuple=False).flatten().tolist()
+            raise RuntimeError(f"Missing support statistics for novel classes: {missing}")
+
+        average_features = sums / counts.to(sums.dtype).unsqueeze(1)
+        self.semantic_metric_matcher.prepare_support_from_moments(
+            sums, outers, counts
+        )
+        diag = self.semantic_metric_matcher.diagnostics()
+        self.logger.info(
+            "=> Support Fisher statistics ready: "
+            f"classes={num_novel}, counts={counts.tolist()}, "
+            f"A_rms={diag['a_rms']:.6f}, A_max={diag['a_max']:.6f}"
+        )
+        return average_features
 
     def pseudo_label_selection(
         self, all_pred_cloud, all_feat_cloud, offset, ps_thresh=0.6
     ):
-        # target_calibrate() executes under torch.no_grad(). Cache the frozen
-        # VLM features here and train only the Fisher matcher afterwards.
+        # target_calibrate() runs under no_grad. Cache frozen VLM features for
+        # the differentiable Fisher metric loss computed afterwards.
         self._metric_train_features = all_feat_cloud.detach()
         return super().pseudo_label_selection(
             all_pred_cloud,
@@ -101,33 +158,28 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         return query, target
 
     def _compute_metric_loss(self, input_dict):
-        if not isinstance(
-            self.semantic_metric_matcher, LearnableFisherRiemannianMatcher
-        ):
+        matcher = self.semantic_metric_matcher
+        if not isinstance(matcher, LearnableCovarianceFisher):
             zero = self.vlm_novel_proto.new_zeros(())
             return zero, zero
 
         features = getattr(self, "_metric_train_features", None)
-        if features is None:
+        if features is None or matcher.support_stats is None:
             zero = self.vlm_novel_proto.new_zeros(())
             return zero, zero
 
-        query, target = self._sample_metric_points(
-            features, input_dict["segment"]
-        )
+        query, target = self._sample_metric_points(features, input_dict["segment"])
         if query is None:
             zero = self.vlm_novel_proto.new_zeros(())
             return zero, zero
 
-        similarities = self.semantic_metric_matcher.similarity(
-            query, self.vlm_novel_proto
-        )
         loss_temp = max(
-            float(getattr(self.cfg, "metric_fisher_loss_temperature", 0.1)),
-            1e-4,
+            float(getattr(self.cfg, "metric_fisher_loss_temperature", 1.0)),
+            1e-6,
         )
-        metric_loss = F.cross_entropy(similarities / loss_temp, target)
-        geo_reg = self.semantic_metric_matcher.deformation_regularization(query)
+        logits = matcher.logits(query, temperature=loss_temp)
+        metric_loss = F.cross_entropy(logits, target)
+        geo_reg = matcher.deformation_regularization()
         return metric_loss, geo_reg
 
     def _sync_fisher_gradients(self):
@@ -147,9 +199,8 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
             if isinstance(value, torch.Tensor):
                 input_dict[key] = value.cuda(non_blocking=True)
 
-        # The original hard pseudo-label path stays unchanged and uses the
-        # current Fisher geometry. Frozen VLM features are cached by the
-        # overridden pseudo_label_selection().
+        # Parent calibration now calls the covariance-Fisher compatibility API,
+        # so both pseudo-label selection and adaptive infilling use G_c^LF.
         new_target = self.target_calibrate(input_dict)
 
         with torch.cuda.amp.autocast(enabled=self.cfg.enable_amp):
@@ -161,8 +212,8 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
                 else self.model.criteria
             )
             seg_loss = criteria(seg_logits, new_target)
-
             metric_loss, geo_reg = self._compute_metric_loss(input_dict)
+
             metric_weight = float(
                 getattr(self.cfg, "metric_fisher_loss_weight", 0.1)
             )
