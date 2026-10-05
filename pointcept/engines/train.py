@@ -414,7 +414,15 @@ class GFS_VL_Trainer(Trainer):
             fisher_temperature=getattr(
                 self.cfg, "metric_fisher_temperature", 1.0
             ),
-        )
+            fisher_support_gamma=getattr(self.cfg, "metric_fisher_support_gamma", 0.2),
+            fisher_residual_scale=getattr(self.cfg, "metric_fisher_residual_scale", 0.5),
+            fisher_calibrator_hidden_dim=getattr(self.cfg, "metric_fisher_calibrator_hidden_dim", 16),
+            fisher_calibrator_bottleneck_dim=getattr(self.cfg, "metric_fisher_calibrator_bottleneck_dim", 8),
+            fisher_metric_temperature=getattr(self.cfg, "metric_fisher_metric_temperature", 0.1),
+            fisher_margin=getattr(self.cfg, "metric_fisher_margin", 0.1),
+            fisher_margin_loss_weight=getattr(self.cfg, "metric_fisher_margin_loss_weight", 0.5),
+            fisher_preserve_loss_weight=getattr(self.cfg, "metric_fisher_preserve_loss_weight", 0.1),
+        ).cuda()
         self.logger.info(
             "=> Semantic matching metric: "
             f"{self.semantic_metric_matcher.metric}"
@@ -696,6 +704,7 @@ class GFS_VL_Trainer(Trainer):
                         proto,
                         novel_proto,
                         class_indices=[novel_idx],
+                        text_class_indices=[class_id],
                     ).squeeze()
                     if similarity < ps_thresh:
                         self.logger.info(
@@ -788,6 +797,7 @@ class GFS_VL_Trainer(Trainer):
                 feat_neg_one,
                 updated_prototypes,
                 class_indices=metric_class_indices,
+                text_class_indices=updated_class_ids,
             )
             max_similarity, max_class_idx = similarities.max(dim=1)
             refined_labels = pred_cloud.clone()
