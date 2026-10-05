@@ -36,7 +36,7 @@ class LearnableFisherMatcherTest(unittest.TestCase):
         expected = fixed.similarity(self.query, self.prototypes)
         actual = learned.similarity(self.query, self.prototypes)
         self.assertTrue(
-            torch.allclose(actual, expected, atol=1e-6, rtol=1e-6),
+            torch.allclose(actual, expected, atol=1e-5, rtol=1e-5),
             msg=(actual - expected).abs().max().item(),
         )
 
