@@ -187,7 +187,7 @@ class LearnableCovarianceFisher(nn.Module):
         return A.view(mu.shape[0], self.feat_dim, self.low_rank)
 
     def distances(self, query, support_stats=None):
-        """Compute support-conditioned Fisher-Riemannian distances [N,C]."""
+        """Compute raw support-conditioned Fisher-Riemannian distances [N,C]."""
         if support_stats is None:
             support_stats = self.support_stats
         if support_stats is None:
@@ -234,6 +234,15 @@ class LearnableCovarianceFisher(nn.Module):
 
         return torch.stack(all_dist, dim=1)
 
+    def normalized_distances(self, query, support_stats=None):
+        """Return mean Fisher energy per feature dimension.
+
+        The quadratic form accumulates energy over D feature dimensions. Dividing
+        by D makes its scale substantially less sensitive to feature dimension
+        and prevents unnecessarily large logits during metric learning.
+        """
+        return self.distances(query, support_stats) / float(self.feat_dim)
+
     def fixed_fisher_distances(self, query, support_stats=None):
         if support_stats is None:
             support_stats = self.support_stats
@@ -265,7 +274,9 @@ class LearnableCovarianceFisher(nn.Module):
     def logits(self, query, support_stats=None, temperature=None):
         if temperature is None:
             temperature = self.match_temperature
-        return -self.distances(query, support_stats) / max(float(temperature), 1e-6)
+        return -self.normalized_distances(query, support_stats) / max(
+            float(temperature), 1e-6
+        )
 
     def probabilities(self, query, support_stats=None, temperature=None):
         return torch.softmax(self.logits(query, support_stats, temperature), dim=-1)
