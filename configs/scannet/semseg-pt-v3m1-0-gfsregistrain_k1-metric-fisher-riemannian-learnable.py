@@ -1,8 +1,8 @@
 _base_ = ["./semseg-pt-v3m1-0-gfsregistrain_k1.py"]
 
-# The legacy text-classifier Fisher is not used in this experiment. The trainer
-# replaces the temporary cosine matcher with support-conditioned covariance
-# Fisher geometry.
+# Decoupled ablation: cosine remains the metric used by pseudo-label selection
+# and adaptive infilling. Learnable covariance Fisher is trained only through
+# the auxiliary metric objective below and does not hard-filter pseudo labels.
 semantic_metric = "cosine"
 train = dict(type="GFS_VL_LearnableFisher_Trainer")
 
