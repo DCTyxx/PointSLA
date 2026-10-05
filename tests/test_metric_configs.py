@@ -14,6 +14,8 @@ class MetricAblationConfigTest(unittest.TestCase):
             "semseg-pt-v3m1-0-gfsregistrain_k1-metric-pca-mahalanobis.py": "pca_mahalanobis",
             "semseg-pt-v3m1-0-gfsregistrain_k1-metric-local-pca.py": "local_pca",
             "semseg-pt-v3m1-0-gfsregistrain_k1-metric-fisher-riemannian.py": "fisher_riemannian",
+            "semseg-pt-v3m1-0-gfsregistrain_k1-metric-fisher-support.py": "fisher_support",
+            "semseg-pt-v3m1-0-gfsregistrain_k1-metric-learnable-fisher.py": "learnable_fisher",
         }
         for filename, metric in expected.items():
             cfg = Config.fromfile(os.path.join(root, filename))

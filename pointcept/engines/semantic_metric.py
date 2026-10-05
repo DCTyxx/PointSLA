@@ -387,6 +387,8 @@ class SemanticMetricMatcher(nn.Module):
     def _support_fisher_similarity(
         self, query, prototypes, text_class_indices=None
     ):
+        if abs(self.fisher_support_gamma) < 1e-12:
+            return self._fisher_similarity(query, prototypes)
         q_logits, p_logits, prob, _, _ = self._support_fisher_state(
             query,
             prototypes,
