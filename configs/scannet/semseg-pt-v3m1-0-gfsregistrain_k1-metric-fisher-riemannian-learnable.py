@@ -21,12 +21,14 @@ metric_fisher_relation_topk = 3
 metric_fisher_init_scale = 1e-3
 metric_fisher_match_temperature = 1.0
 
-# Optimization of h_theta. The frozen 3D VLM is never unfrozen.
+# Optimization of h_theta. Fisher distances are normalized by feature dimension
+# before conversion to logits. Gradient clipping is applied after DDP averaging.
 metric_fisher_lr = 1e-3
 metric_fisher_weight_decay = 0.0
 metric_fisher_loss_weight = 0.1
 metric_fisher_loss_temperature = 1.0
 metric_fisher_reg_weight = 1e-3
 metric_fisher_max_points = 4096
+metric_fisher_grad_clip = 5.0
 
 num_worker_test = 0
