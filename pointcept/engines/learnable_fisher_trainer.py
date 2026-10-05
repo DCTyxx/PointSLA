@@ -8,10 +8,12 @@ import pointcept.utils.comm as comm
 
 @TRAINERS.register_module("GFS_VL_LearnableFisher_Trainer")
 class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
-    """GFS-VL trainer with decoupled Learnable Fisher metric learning.
+    """GFS-VL trainer with Fisher geometry regularizing backbone features.
 
-    The frozen 3D VLM supplies support/query features. For each registration
-    episode we estimate class moments and build
+    Pseudo-label selection and adaptive infilling keep the original cosine
+    calibration path. In parallel, novel-class support points are encoded by
+    the trainable point-cloud backbone (under no-grad) to estimate class moments
+    and construct a support-conditioned Fisher geometry
 
         G_c^F = (Sigma_c + eps I)^(-1).
 
@@ -23,10 +25,10 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
 
         G_c^LF = G_c^{F/2}(I + alpha A_c A_c^T)G_c^{F/2}.
 
-    In this ablation, Learnable Fisher is optimized only through its auxiliary
-    metric loss. Pseudo-label selection and adaptive infilling keep using the
-    original semantic metric configured by ``semantic_metric`` (cosine here),
-    so the learned Fisher metric cannot hard-filter novel pseudo labels.
+    During training, query backbone features are NOT detached. Therefore the
+    Fisher metric CE directly regularizes the trainable point-cloud backbone,
+    while the support-side statistics remain detached/fixed within each
+    registration run.
     """
 
     def build_zero_shot_model(self):
@@ -38,8 +40,15 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         if not bool(getattr(self.cfg, "metric_fisher_learnable", True)):
             return
 
+        feat_dim = int(
+            getattr(
+                self.cfg,
+                "metric_fisher_feat_dim",
+                getattr(self.cfg.model, "backbone_out_channels", 64),
+            )
+        )
         matcher = LearnableCovarianceFisher(
-            feat_dim=int(getattr(self.cfg, "metric_fisher_feat_dim", 512)),
+            feat_dim=feat_dim,
             spectral_rank=int(
                 getattr(self.cfg, "metric_fisher_spectral_rank", 32)
             ),
@@ -74,101 +83,160 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
 
         n_metric = sum(p.numel() for p in metric_params)
         self.logger.info(
-            "=> Learnable covariance Fisher enabled as auxiliary metric learner: "
-            f"params={n_metric}, spectral_rank={matcher.spectral_rank}, "
-            f"low_rank={matcher.low_rank}, alpha={matcher.alpha}, eps={matcher.eps}, "
+            "=> Learnable covariance Fisher enabled for backbone representation learning: "
+            f"params={n_metric}, feat_dim={matcher.feat_dim}, "
+            f"spectral_rank={matcher.spectral_rank}, low_rank={matcher.low_rank}, "
+            f"alpha={matcher.alpha}, eps={matcher.eps}, "
             f"grad_clip={getattr(self.cfg, 'metric_fisher_grad_clip', 5.0)}, "
             f"metric_compute=fp32, calibration_metric={self.semantic_metric_matcher.metric}"
         )
 
-    def extract_3d_vlm_proto(self, regis_val_loader):
-        """Estimate cosine prototypes plus support moments for Learnable Fisher."""
-        num_novel = self.cfg.data.num_base_novels - self.cfg.data.num_bases
-        feat_dim = int(getattr(self.cfg, "metric_fisher_feat_dim", 512))
-        sums = torch.zeros(num_novel, feat_dim, device="cuda", dtype=torch.float32)
-        outers = torch.zeros(
-            num_novel, feat_dim, feat_dim, device="cuda", dtype=torch.float32
-        )
-        counts = torch.zeros(num_novel, device="cuda", dtype=torch.long)
+    def _model_module(self):
+        return self.model.module if comm.get_world_size() > 1 else self.model
 
-        # Keep compatibility with any calibration metric that needs support
-        # statistics. For cosine this is a no-op.
+    def extract_3d_vlm_proto(self, regis_val_loader):
+        """Build cosine VLM prototypes and backbone-space Fisher statistics.
+
+        The VLM support features remain responsible only for the original cosine
+        pseudo-label calibration. Fisher moments are estimated separately from
+        the point-cloud backbone feature space so support and query features live
+        in the same metric space.
+        """
+        num_novel = self.cfg.data.num_base_novels - self.cfg.data.num_bases
+        vlm_feat_dim = 512
+        fisher_feat_dim = int(getattr(self.cfg, "metric_fisher_feat_dim", 64))
+
+        vlm_sums = torch.zeros(
+            num_novel, vlm_feat_dim, device="cuda", dtype=torch.float32
+        )
+        vlm_counts = torch.zeros(num_novel, device="cuda", dtype=torch.long)
+
+        fisher_sums = torch.zeros(
+            num_novel, fisher_feat_dim, device="cuda", dtype=torch.float32
+        )
+        fisher_outers = torch.zeros(
+            num_novel,
+            fisher_feat_dim,
+            fisher_feat_dim,
+            device="cuda",
+            dtype=torch.float32,
+        )
+        fisher_counts = torch.zeros(num_novel, device="cuda", dtype=torch.long)
+
         if getattr(self.semantic_metric_matcher, "needs_support_statistics", False):
             self.semantic_metric_matcher.reset_support_statistics(
-                num_novel, feat_dim, torch.device("cuda")
+                num_novel, vlm_feat_dim, torch.device("cuda")
             )
 
-        for input_dict in regis_val_loader:
-            for key, value in input_dict.items():
-                if isinstance(value, torch.Tensor):
-                    input_dict[key] = value.cuda(non_blocking=True)
+        model_module = self._model_module()
+        was_training = model_module.training
+        model_module.eval()
 
-            with torch.no_grad():
-                data_dict = self.construct_3D_vlm_input(input_dict)
-                output_dict = self.VLM_3D(data_dict)
-                vlm_feats = output_dict["all_feats"].float()
+        try:
+            for input_dict in regis_val_loader:
+                for key, value in input_dict.items():
+                    if isinstance(value, torch.Tensor):
+                        input_dict[key] = value.cuda(non_blocking=True)
 
-                for class_id in input_dict["segment"].unique():
-                    class_id = int(class_id.item())
-                    if class_id == -1:
-                        continue
-                    assert class_id >= self.cfg.data.num_bases
-                    idx = class_id - self.cfg.data.num_bases
-                    class_features = vlm_feats[input_dict["segment"] == class_id]
-                    if class_features.numel() == 0:
-                        continue
+                with torch.no_grad():
+                    # Frozen VLM features for the original cosine calibration.
+                    data_dict = self.construct_3D_vlm_input(input_dict)
+                    vlm_output = self.VLM_3D(data_dict)
+                    vlm_feats = vlm_output["all_feats"].float()
 
-                    sums[idx] += class_features.sum(dim=0)
-                    outers[idx] += class_features.transpose(0, 1) @ class_features
-                    counts[idx] += class_features.shape[0]
-
-                    if getattr(
-                        self.semantic_metric_matcher,
-                        "needs_support_statistics",
-                        False,
-                    ):
-                        self.semantic_metric_matcher.update_support_statistics(
-                            idx, class_features
+                    # Trainable point-cloud backbone support features are sampled
+                    # under no-grad. They define a fixed support geometry for this
+                    # registration run, but are in the same space as train queries.
+                    backbone_feats = model_module.getFeatures(input_dict).float()
+                    if backbone_feats.shape[-1] != fisher_feat_dim:
+                        raise RuntimeError(
+                            "Fisher feature dimension mismatch: "
+                            f"config={fisher_feat_dim}, backbone={backbone_feats.shape[-1]}"
                         )
+
+                    for class_id in input_dict["segment"].unique():
+                        class_id = int(class_id.item())
+                        if class_id == -1:
+                            continue
+                        assert class_id >= self.cfg.data.num_bases
+                        idx = class_id - self.cfg.data.num_bases
+                        class_mask = input_dict["segment"] == class_id
+
+                        class_vlm = vlm_feats[class_mask]
+                        if class_vlm.numel() > 0:
+                            vlm_sums[idx] += class_vlm.sum(dim=0)
+                            vlm_counts[idx] += class_vlm.shape[0]
+                            if getattr(
+                                self.semantic_metric_matcher,
+                                "needs_support_statistics",
+                                False,
+                            ):
+                                self.semantic_metric_matcher.update_support_statistics(
+                                    idx, class_vlm
+                                )
+
+                        class_backbone = backbone_feats[class_mask]
+                        if class_backbone.numel() > 0:
+                            fisher_sums[idx] += class_backbone.sum(dim=0)
+                            fisher_outers[idx] += (
+                                class_backbone.transpose(0, 1) @ class_backbone
+                            )
+                            fisher_counts[idx] += class_backbone.shape[0]
+        finally:
+            if was_training:
+                model_module.train()
 
         if comm.get_world_size() > 1:
             # Every rank scans the same registration set. Broadcast rank-0
-            # moments so all ranks use exactly the same Fisher geometry.
-            torch.distributed.broadcast(sums, src=0)
-            torch.distributed.broadcast(outers, src=0)
-            torch.distributed.broadcast(counts, src=0)
+            # statistics so all ranks use identical support geometry.
+            torch.distributed.broadcast(vlm_sums, src=0)
+            torch.distributed.broadcast(vlm_counts, src=0)
+            torch.distributed.broadcast(fisher_sums, src=0)
+            torch.distributed.broadcast(fisher_outers, src=0)
+            torch.distributed.broadcast(fisher_counts, src=0)
 
-        if not torch.all(counts > 0):
-            missing = torch.nonzero(counts <= 0, as_tuple=False).flatten().tolist()
-            raise RuntimeError(f"Missing support statistics for novel classes: {missing}")
+        if not torch.all(vlm_counts > 0):
+            missing = torch.nonzero(vlm_counts <= 0, as_tuple=False).flatten().tolist()
+            raise RuntimeError(f"Missing VLM support statistics for novel classes: {missing}")
+        if not torch.all(fisher_counts > 0):
+            missing = (
+                torch.nonzero(fisher_counts <= 0, as_tuple=False).flatten().tolist()
+            )
+            raise RuntimeError(
+                f"Missing backbone Fisher statistics for novel classes: {missing}"
+            )
 
         if getattr(self.semantic_metric_matcher, "needs_support_statistics", False):
             self.semantic_metric_matcher.finalize_support_statistics()
 
-        average_features = sums / counts.to(sums.dtype).unsqueeze(1)
+        average_vlm_features = vlm_sums / vlm_counts.to(vlm_sums.dtype).unsqueeze(1)
 
         matcher = self.learnable_fisher_matcher
         if isinstance(matcher, LearnableCovarianceFisher):
-            matcher.prepare_support_from_moments(sums, outers, counts)
+            # Support geometry is intentionally detached: gradients should shape
+            # query/backbone representations, not backpropagate through covariance
+            # estimation/eigendecomposition on the few-shot support set.
+            matcher.prepare_support_from_moments(
+                fisher_sums.detach(),
+                fisher_outers.detach(),
+                fisher_counts.detach(),
+            )
             diag = matcher.diagnostics()
             self.logger.info(
-                "=> Support Fisher statistics ready: "
-                f"classes={num_novel}, counts={counts.tolist()}, "
-                f"rank={diag['spectral_rank']}, "
+                "=> Backbone-space Fisher support statistics ready: "
+                f"classes={num_novel}, counts={fisher_counts.tolist()}, "
+                f"feat_dim={fisher_feat_dim}, rank={diag['spectral_rank']}, "
                 f"A_rms={diag['a_rms']:.6f}, A_max={diag['a_max']:.6f}; "
                 f"pseudo_label_metric={self.semantic_metric_matcher.metric}"
             )
 
-        return average_features
+        return average_vlm_features
 
     def pseudo_label_selection(
         self, all_pred_cloud, all_feat_cloud, offset, ps_thresh=0.6
     ):
-        # target_calibrate() runs under no_grad. Cache frozen VLM features for
-        # the differentiable Fisher metric loss computed afterwards. The parent
-        # selection itself uses self.semantic_metric_matcher, which remains the
-        # original cosine matcher in this ablation.
-        self._metric_train_features = all_feat_cloud.detach()
+        # Pseudo-label selection remains fully on the original semantic matcher
+        # (cosine in this experiment); Fisher does not hard-filter labels.
         return super().pseudo_label_selection(
             all_pred_cloud,
             all_feat_cloud,
@@ -189,25 +257,34 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
             perm = torch.randperm(idx.numel(), device=idx.device)[:max_points]
             idx = idx[perm]
 
-        query = features[idx].detach()
+        # IMPORTANT: no detach here. Fisher metric CE must backpropagate through
+        # these point-wise features into the point-cloud backbone.
+        query = features[idx]
         target = labels[idx].long() - num_bases
         return query, target
 
-    def _compute_metric_loss(self, input_dict):
+    def _compute_metric_loss(self, backbone_features, input_dict):
         matcher = self.learnable_fisher_matcher
         if not isinstance(matcher, LearnableCovarianceFisher):
+            zero = backbone_features.new_zeros(())
+            return zero, zero
+
+        if backbone_features is None or matcher.support_stats is None:
             zero = self.vlm_novel_proto.new_zeros(())
             return zero, zero
 
-        features = getattr(self, "_metric_train_features", None)
-        if features is None or matcher.support_stats is None:
-            zero = self.vlm_novel_proto.new_zeros(())
-            return zero, zero
-
-        query, target = self._sample_metric_points(features, input_dict["segment"])
+        query, target = self._sample_metric_points(
+            backbone_features, input_dict["segment"]
+        )
         if query is None:
-            zero = self.vlm_novel_proto.new_zeros(())
+            zero = backbone_features.new_zeros(())
             return zero, zero
+
+        if query.shape[-1] != matcher.feat_dim:
+            raise RuntimeError(
+                "Query/Fisher feature dimension mismatch: "
+                f"query={query.shape[-1]}, fisher={matcher.feat_dim}"
+            )
 
         loss_temp = max(
             float(getattr(self.cfg, "metric_fisher_loss_temperature", 1.0)),
@@ -215,8 +292,9 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         )
 
         # Fisher whitening contains inverse variances, square roots and
-        # quadratic forms. Keep the Fisher branch in fp32 even when the main
-        # segmentation network uses AMP.
+        # quadratic forms. Keep the metric computation in fp32 even when the
+        # segmentation forward uses AMP. The cast preserves autograd to the
+        # original backbone feature tensor.
         with torch.cuda.amp.autocast(enabled=False):
             logits = matcher.logits(query.float(), temperature=loss_temp)
             metric_loss = F.cross_entropy(logits.float(), target)
@@ -258,7 +336,7 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         return bool(finite.item())
 
     def _clip_fisher_gradients(self):
-        """Clip only finite Learnable Fisher gradients after DDP averaging."""
+        """Clip only finite Learnable Fisher-generator gradients after DDP averaging."""
         max_norm = float(getattr(self.cfg, "metric_fisher_grad_clip", 5.0))
         if max_norm <= 0:
             return None
@@ -281,28 +359,31 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
             if isinstance(value, torch.Tensor):
                 input_dict[key] = value.cuda(non_blocking=True)
 
-        # Pseudo-label selection and adaptive infilling use the original
-        # semantic matcher (cosine in this config). Learnable Fisher is fully
-        # decoupled from the hard pseudo-label decisions in this ablation.
+        # Pseudo-label selection and adaptive infilling remain cosine-based.
         new_target = self.target_calibrate(input_dict)
 
         with torch.cuda.amp.autocast(enabled=self.cfg.enable_amp):
             output_dict = self.model(input_dict)
             seg_logits = output_dict.pop("seg_logits")
+            backbone_feat = output_dict.pop("backbone_feat")
             criteria = (
                 self.model.module.criteria
                 if comm.get_world_size() > 1
                 else self.model.criteria
             )
             seg_loss = criteria(seg_logits, new_target)
-            # _compute_metric_loss explicitly disables autocast internally.
-            metric_loss, geo_reg = self._compute_metric_loss(input_dict)
+
+            # _compute_metric_loss disables autocast internally. Crucially,
+            # backbone_feat remains connected to the trainable backbone graph.
+            metric_loss, geo_reg = self._compute_metric_loss(
+                backbone_feat, input_dict
+            )
 
             metric_weight = float(
-                getattr(self.cfg, "metric_fisher_loss_weight", 0.1)
+                getattr(self.cfg, "metric_fisher_loss_weight", 0.05)
             )
             reg_weight = float(
-                getattr(self.cfg, "metric_fisher_reg_weight", 1e-3)
+                getattr(self.cfg, "metric_fisher_reg_weight", 1e-2)
             )
             loss = seg_loss + metric_weight * metric_loss + reg_weight * geo_reg
             output_dict["loss"] = loss
@@ -313,8 +394,8 @@ class GFS_VL_LearnableFisher_Trainer(GFS_VL_Trainer):
         self.optimizer.zero_grad()
         if self.cfg.enable_amp:
             self.scaler.scale(loss).backward()
-            # Fisher is not wrapped by DDP. Unscale first, average its true
-            # gradients across ranks, verify finiteness, then clip.
+            # The backbone is wrapped by DDP and synchronizes automatically.
+            # The Fisher generator is trainer-side, so synchronize it manually.
             self.scaler.unscale_(self.optimizer)
             self._sync_fisher_gradients()
             if not self._fisher_gradients_finite():
