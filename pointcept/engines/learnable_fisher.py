@@ -1,166 +1,175 @@
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
 
-class LearnableFisherRiemannianMatcher(nn.Module):
-    """Task-learnable deformation of the frozen semantic Fisher metric.
+class LearnableCovarianceFisher(nn.Module):
+    """Support-conditioned learnable Fisher-Riemannian metric.
 
-    The fixed Fisher pullback induced by the frozen text classifier is
+    Implements
+        G_c^LF = G_c^{F/2} (I + alpha A_c A_c^T) G_c^{F/2},
+    where
+        G_c^F = (Sigma_c + eps I)^{-1},
+        A_c = h_theta(mu_c, Lambda_c, R_c).
 
-        G_F(z) = T^T [Diag(p(z)) - p(z)p(z)^T] T.
-
-    We preserve this statistical geometry and learn only a positive diagonal
-    deformation in classifier space,
-
-        G_theta(z) = T^T W_theta(z) F(z) W_theta(z) T + ridge * I,
-
-    where W_theta(z) is initialized to the identity.  Consequently the module
-    exactly recovers the original Fisher-Riemannian metric at initialization,
-    while task supervision can learn which semantic competition directions
-    should receive more or less curvature.
+    Computation is performed in the retained covariance eigenspace to avoid
+    constructing dense D x D metric tensors.
     """
 
     def __init__(
         self,
-        text_embed,
-        metric_ridge=1e-3,
-        fisher_temperature=1.0,
-        hidden_dim=32,
-        residual_scale=0.25,
-        learn_temperature=True,
-        max_log_weight=2.0,
+        feat_dim=512,
+        rank=32,
+        low_rank=8,
+        hidden_dim=128,
+        alpha=0.25,
+        eps=1e-3,
+        shrinkage=0.1,
+        relation_topk=3,
     ):
         super().__init__()
-        if text_embed is None:
-            raise ValueError(
-                "LearnableFisherRiemannianMatcher requires frozen text embeddings."
-            )
+        self.feat_dim = int(feat_dim)
+        self.rank = int(rank)
+        self.low_rank = int(low_rank)
+        self.hidden_dim = int(hidden_dim)
+        self.alpha = float(alpha)
+        self.eps = float(eps)
+        self.shrinkage = float(shrinkage)
+        self.relation_topk = int(relation_topk)
 
-        self.register_buffer("text_embed", text_embed.detach().float())
-        self.metric = "fisher_riemannian"
-        self.metric_ridge = float(metric_ridge)
-        self.residual_scale = float(residual_scale)
-        self.max_log_weight = float(max_log_weight)
-        self.learn_temperature = bool(learn_temperature)
-
-        init_temp = max(float(fisher_temperature), 1e-4)
-        log_temp = torch.tensor(math.log(init_temp), dtype=torch.float32)
-        if self.learn_temperature:
-            self.log_temperature = nn.Parameter(log_temp)
-        else:
-            self.register_buffer("log_temperature", log_temp)
-
-        # The same small calibrator is shared by all semantic classes.  This is
-        # deliberately class-agnostic so the learned rule transfers to novel
-        # classes rather than memorising a per-class metric.
-        self.weight_net = nn.Sequential(
-            nn.Linear(3, int(hidden_dim)),
+        descriptor_dim = 2 * self.rank + 2 * self.relation_topk
+        self.generator = nn.Sequential(
+            nn.Linear(descriptor_dim, self.hidden_dim),
             nn.GELU(),
-            nn.Linear(int(hidden_dim), 1),
+            nn.Linear(self.hidden_dim, self.rank * self.low_rank),
         )
+        # A_c = 0 at initialization, so the method starts from fixed Fisher.
+        nn.init.zeros_(self.generator[-1].weight)
+        nn.init.zeros_(self.generator[-1].bias)
 
-        # Zero-init the residual head: W_theta(z)=I at step 0, i.e. the exact
-        # fixed Fisher baseline before learning starts.
-        nn.init.zeros_(self.weight_net[-1].weight)
-        nn.init.zeros_(self.weight_net[-1].bias)
+    @staticmethod
+    def _covariance(x):
+        if x.shape[0] <= 1:
+            dim = x.shape[1]
+            return torch.eye(dim, device=x.device, dtype=x.dtype)
+        centered = x - x.mean(dim=0, keepdim=True)
+        return centered.transpose(0, 1) @ centered / float(x.shape[0] - 1)
 
-    @property
-    def needs_support_statistics(self):
-        return False
+    def _shrink_covariance(self, cov):
+        dim = cov.shape[0]
+        cov = 0.5 * (cov + cov.transpose(0, 1))
+        avg_var = torch.trace(cov).clamp_min(1e-8) / dim
+        eye = torch.eye(dim, device=cov.device, dtype=cov.dtype)
+        return (1.0 - self.shrinkage) * cov + self.shrinkage * avg_var * eye
 
-    def reset_support_statistics(self, *args, **kwargs):
-        return None
+    def fit_support(self, class_features):
+        """Estimate mu_c, Lambda_c, R_c and generate A_c for an episode."""
+        if len(class_features) == 0:
+            raise ValueError("class_features must contain at least one class")
 
-    def update_support_statistics(self, *args, **kwargs):
-        return None
+        means, bases, evals, projected_means = [], [], [], []
+        for x in class_features:
+            if x.ndim != 2 or x.shape[1] != self.feat_dim:
+                raise ValueError(
+                    f"Expected support features [N,{self.feat_dim}], got {tuple(x.shape)}"
+                )
+            x = x.float()
+            mu = x.mean(dim=0)
+            cov = self._shrink_covariance(self._covariance(x))
+            eigvals, eigvecs = torch.linalg.eigh(cov)
+            r = min(self.rank, eigvals.numel())
+            lam = eigvals[-r:].clamp_min(self.eps)
+            U = eigvecs[:, -r:]
+            if r < self.rank:
+                pad_r = self.rank - r
+                U = F.pad(U, (0, pad_r))
+                lam = F.pad(lam, (0, pad_r), value=self.eps)
+            means.append(mu)
+            bases.append(U)
+            evals.append(lam)
+            projected_means.append(mu @ U)
 
-    def finalize_support_statistics(self):
-        return None
-
-    def temperature(self):
-        return self.log_temperature.exp().clamp(0.05, 20.0)
-
-    def _fisher_state(self, query):
-        q = query.float()
-        text = self.text_embed.to(q.device, dtype=q.dtype)
-        q_logits = q @ text.transpose(0, 1)
-
-        temperature = self.temperature().to(q.dtype)
-        prob = torch.softmax(q_logits / temperature, dim=-1)
-
-        mean = q_logits.mean(dim=-1, keepdim=True)
-        std = q_logits.std(dim=-1, keepdim=True, unbiased=False).clamp_min(1e-6)
-        normalized_logits = (q_logits - mean) / std
-
-        # Three class-agnostic descriptors: semantic evidence, posterior mass,
-        # and local categorical uncertainty.  The resulting correction remains
-        # point-dependent while sharing parameters across base/novel classes.
-        descriptor = torch.stack(
-            [normalized_logits, prob, prob * (1.0 - prob)], dim=-1
+        means = torch.stack(means, dim=0)
+        bases = torch.stack(bases, dim=0)
+        evals = torch.stack(evals, dim=0)
+        projected_means = torch.stack(projected_means, dim=0)
+        relations = self._inter_class_relations(means)
+        descriptor = torch.cat(
+            [projected_means, torch.log(evals + self.eps), relations], dim=-1
         )
-        delta = self.weight_net(descriptor).squeeze(-1)
-        log_weight = (self.residual_scale * delta).clamp(
-            -self.max_log_weight, self.max_log_weight
+        A = self.generator(descriptor).view(
+            len(class_features), self.rank, self.low_rank
         )
-        weight = torch.exp(log_weight)
-        return q_logits, prob, weight
-
-    def similarity(self, query, prototypes, class_indices=None):
-        """Return Fisher-metric cosine similarities [N_query, N_proto]."""
-        del class_indices  # Kept for API compatibility with SemanticMetricMatcher.
-        if query.ndim == 1:
-            query = query.unsqueeze(0)
-        if prototypes.ndim == 1:
-            prototypes = prototypes.unsqueeze(0)
-
-        q = query.float()
-        p = prototypes.float()
-        text = self.text_embed.to(q.device, dtype=q.dtype)
-
-        q_logits, prob, weight = self._fisher_state(q)
-        p_logits = p @ text.transpose(0, 1)
-
-        # W_theta is diagonal and strictly positive, so W F W remains PSD.
-        q_tangent = q_logits * weight
-        p_tangent = p_logits.unsqueeze(0) * weight.unsqueeze(1)
-
-        eq = (prob * q_tangent).sum(dim=-1)
-        ep = (prob.unsqueeze(1) * p_tangent).sum(dim=-1)
-        eqp = (
-            prob.unsqueeze(1)
-            * q_tangent.unsqueeze(1)
-            * p_tangent
-        ).sum(dim=-1)
-        fisher_inner = eqp - eq.unsqueeze(1) * ep
-
-        q_var = (prob * q_tangent.square()).sum(dim=-1) - eq.square()
-        p_var = (prob.unsqueeze(1) * p_tangent.square()).sum(dim=-1) - ep.square()
-
-        euclidean_inner = q @ p.transpose(0, 1)
-        inner = fisher_inner + self.metric_ridge * euclidean_inner
-
-        q_norm = q_var + self.metric_ridge * q.square().sum(dim=-1)
-        p_norm = p_var + self.metric_ridge * p.square().sum(dim=-1).unsqueeze(0)
-        denom = torch.sqrt(
-            q_norm.clamp_min(1e-12).unsqueeze(1)
-            * p_norm.clamp_min(1e-12)
-        )
-        return (inner / denom).clamp(-1.0, 1.0)
-
-    def deformation_regularization(self, query):
-        """Keep the learned geometry close to the fixed Fisher anchor."""
-        if query.numel() == 0:
-            return self.log_temperature.new_zeros(())
-        _, _, weight = self._fisher_state(query)
-        identity_penalty = (weight - 1.0).square().mean()
-        return identity_penalty
-
-    def parameter_summary(self):
-        total = sum(p.numel() for p in self.parameters() if p.requires_grad)
         return {
-            "trainable_parameters": int(total),
-            "temperature": float(self.temperature().detach().cpu()),
+            "means": means,
+            "bases": bases,
+            "evals": evals,
+            "A": A,
+            "relations": relations,
         }
+
+    def _inter_class_relations(self, means):
+        """R_c: top-k nearest competing-class cosine and Euclidean relations."""
+        C = means.shape[0]
+        k = self.relation_topk
+        if C <= 1:
+            return means.new_zeros((C, 2 * k))
+        norm_means = F.normalize(means, dim=-1)
+        cosine = norm_means @ norm_means.transpose(0, 1)
+        euclidean = torch.cdist(means, means, p=2)
+        eye = torch.eye(C, device=means.device, dtype=torch.bool)
+        cosine = cosine.masked_fill(eye, -float("inf"))
+        euclidean = euclidean.masked_fill(eye, float("inf"))
+        kk = min(k, C - 1)
+        nearest_idx = euclidean.topk(kk, largest=False, dim=-1).indices
+        cos_rel = torch.gather(cosine, 1, nearest_idx)
+        l2_rel = torch.gather(euclidean, 1, nearest_idx)
+        if kk < k:
+            cos_rel = F.pad(cos_rel, (0, k - kk))
+            l2_rel = F.pad(l2_rel, (0, k - kk))
+        return torch.cat([cos_rel, torch.log1p(l2_rel.clamp_min(0.0))], dim=-1)
+
+    def distances(self, query, stats):
+        """Compute d_c^2=(q-mu_c)^T G_c^LF (q-mu_c)."""
+        q = query.float()
+        means = stats["means"]
+        bases = stats["bases"]
+        evals = stats["evals"]
+        A = stats["A"]
+        all_dist = []
+        for c in range(means.shape[0]):
+            delta = q - means[c]
+            U = bases[c]
+            lam = evals[c]
+            Ac = A[c]
+
+            # Fisher-normalized coordinate x = G_F^{1/2}(q-mu_c)
+            # represented in the retained covariance eigenspace.
+            x = (delta @ U) / torch.sqrt(lam + self.eps)
+            base = x.square().sum(dim=-1)
+            low_rank = (x @ Ac).square().sum(dim=-1)
+            dist = base + self.alpha * low_rank
+
+            # Weak positive ridge on discarded directions.
+            projected = (delta @ U) @ U.transpose(0, 1)
+            residual = delta - projected
+            dist = dist + self.eps * residual.square().sum(dim=-1)
+            all_dist.append(dist)
+        return torch.stack(all_dist, dim=1)
+
+    def logits(self, query, stats, temperature=1.0):
+        return -self.distances(query, stats) / max(float(temperature), 1e-6)
+
+    def deformation_regularization(self, stats):
+        return stats["A"].square().mean()
+
+    def metric_diagnostics(self, stats):
+        with torch.no_grad():
+            A = stats["A"]
+            return {
+                "a_rms": A.square().mean().sqrt().item(),
+                "a_max": A.abs().max().item(),
+                "alpha": self.alpha,
+                "rank": self.rank,
+                "low_rank": self.low_rank,
+            }
