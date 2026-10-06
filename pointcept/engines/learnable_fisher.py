@@ -8,12 +8,18 @@ class LearnableCovarianceFisher(nn.Module):
 
     Core formulation:
         G_c^LF = G_c^{F/2} (I + alpha A_c A_c^T) G_c^{F/2},
-        G_c^F  = (Sigma_c + eps I)^{-1},
+        G_c^F  = (Sigma_c + eps I)^(-1),
         A_c    = h_theta(mu_c, Lambda_c, R_c).
 
     For efficiency, G_c^F is represented by a rank-m eigenspace plus an
     isotropic residual precision. The learned deformation acts on the resulting
     approximate G_c^{F/2}, avoiding dense D x D transforms for every query.
+
+    Optionally, the support covariance can be expanded into a local ellipsoidal
+    support region before inversion. The retained/tangent directions and the
+    residual subspace are expanded anisotropically in closed form, which is
+    equivalent to integrating zero-mean Gaussian perturbations around observed
+    support features without Monte-Carlo sampling.
     """
 
     def __init__(
@@ -42,6 +48,12 @@ class LearnableCovarianceFisher(nn.Module):
         self.match_temperature = float(match_temperature)
         self.metric = "learnable_cov_fisher"
         self.support_stats = None
+
+        # Stage-3 support-region exploration is opt-in so the exact Stage-1
+        # behaviour remains available through the original trainer/config.
+        self.region_exploration = False
+        self.region_tangent_scale = 0.0
+        self.region_residual_scale = 0.0
 
         self.mu_encoder = nn.Sequential(
             nn.Linear(self.feat_dim, self.hidden_dim),
@@ -79,12 +91,42 @@ class LearnableCovarianceFisher(nn.Module):
     def finalize_support_statistics(self):
         return None
 
+    def configure_region_exploration(
+        self,
+        enabled=True,
+        tangent_scale=0.5,
+        residual_scale=0.1,
+    ):
+        """Configure closed-form anisotropic exploration of support regions.
+
+        Let the empirical covariance eigensystem be (U, lambda). Around each
+        observed support feature, consider zero-mean local perturbations whose
+        standard deviations are ``tangent_scale * sqrt(lambda)`` in the retained
+        eigenspace and ``residual_scale * sqrt(residual_var)`` in the orthogonal
+        residual subspace. Marginalizing those perturbations adds their covariance,
+        therefore the explored variances are exactly
+
+            lambda_tilde = (1 + tangent_scale^2) * lambda,
+            var_perp_tilde = (1 + residual_scale^2) * var_perp.
+
+        No synthetic points are materialized and no extra stochasticity is added.
+        """
+        tangent_scale = float(tangent_scale)
+        residual_scale = float(residual_scale)
+        if tangent_scale < 0.0 or residual_scale < 0.0:
+            raise ValueError("Region exploration scales must be non-negative")
+        self.region_exploration = bool(enabled)
+        self.region_tangent_scale = tangent_scale
+        self.region_residual_scale = residual_scale
+        return self
+
     def prepare_support_from_moments(self, sums, outers, counts):
         """Estimate mu_c, a stable covariance spectrum, and R_c."""
         if sums.ndim != 2 or sums.shape[1] != self.feat_dim:
             raise ValueError(f"Expected sums [C,{self.feat_dim}]")
         C, D = sums.shape
         means, bases, evals, residual_precs = [], [], [], []
+        raw_evals, raw_residual_vars = [], []
         eye = torch.eye(D, device=sums.device, dtype=sums.dtype)
 
         with torch.no_grad():
@@ -115,17 +157,35 @@ class LearnableCovarianceFisher(nn.Module):
                     residual_var = lam_all[:-m].mean().clamp_min(0.0)
                 else:
                     residual_var = lam_all.new_zeros(())
+
+                # Stage-3: interpret each observed support feature as the centre
+                # of a small local ellipsoidal region. We integrate that region
+                # analytically by adding the perturbation covariance. Expansion
+                # is deliberately stronger along observed retained/tangent
+                # directions than in the residual subspace.
+                raw_lam = lam
+                raw_residual_var = residual_var
+                if self.region_exploration:
+                    tangent_factor = 1.0 + self.region_tangent_scale ** 2
+                    residual_factor = 1.0 + self.region_residual_scale ** 2
+                    lam = lam * tangent_factor
+                    residual_var = residual_var * residual_factor
+
                 residual_prec = 1.0 / (residual_var + self.eps)
 
                 means.append(mu.float())
                 bases.append(U.float())
                 evals.append(lam.float())
                 residual_precs.append(residual_prec.float())
+                raw_evals.append(raw_lam.float())
+                raw_residual_vars.append(raw_residual_var.float())
 
             means = torch.stack(means, dim=0)
             bases = torch.stack(bases, dim=0)
             evals = torch.stack(evals, dim=0)
             residual_precs = torch.stack(residual_precs, dim=0)
+            raw_evals = torch.stack(raw_evals, dim=0)
+            raw_residual_vars = torch.stack(raw_residual_vars, dim=0)
             relations = self._inter_class_relations(means)
 
         stats = {
@@ -134,6 +194,10 @@ class LearnableCovarianceFisher(nn.Module):
             "evals": evals.detach(),
             "residual_precs": residual_precs.detach(),
             "relations": relations.detach(),
+            # Raw spectra are retained only for diagnostics/ablation analysis;
+            # distances and the deformation generator use the explored spectra.
+            "raw_evals": raw_evals.detach(),
+            "raw_residual_vars": raw_residual_vars.detach(),
         }
         self.support_stats = stats
         return stats
@@ -306,10 +370,19 @@ class LearnableCovarianceFisher(nn.Module):
             device = next(self.parameters()).device
             stats = self._stats_on(support_stats, device)
             A = self.generate_deformation(stats)
-            return {
+            diag = {
                 "a_rms": float(A.square().mean().sqrt().cpu()),
                 "a_max": float(A.abs().max().cpu()),
                 "alpha": self.alpha,
                 "spectral_rank": self.spectral_rank,
                 "low_rank": self.low_rank,
+                "region_exploration": self.region_exploration,
+                "region_tangent_scale": self.region_tangent_scale,
+                "region_residual_scale": self.region_residual_scale,
             }
+            if "raw_evals" in stats:
+                raw = stats["raw_evals"].clamp_min(1e-12)
+                diag["region_retained_variance_ratio"] = float(
+                    (stats["evals"] / raw).mean().cpu()
+                )
+            return diag
