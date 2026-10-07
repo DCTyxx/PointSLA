@@ -46,3 +46,18 @@ scheduler = dict(
     div_factor=10.0,
     final_div_factor=1000.0,
 )
+
+# Base-only held-out CDC geometry diagnostics. This is deliberately independent
+# of the standard segmentation evaluator so no novel/few-shot information is
+# involved in Step-1 model diagnosis or hyper-parameter selection.
+cdc_geometry_eval = dict(
+    enabled=True,
+    interval=5,
+    max_batches=32,
+    max_points_per_class=256,
+    num_anchors=256,
+    knn=16,
+    inter_knn=16,
+    svr_directions=4,
+    num_workers=4,
+)
