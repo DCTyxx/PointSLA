@@ -14,7 +14,8 @@ Protocol:
 _base_ = ["./semseg-pt-v3m1-0-tangent-cdcbase-frozen-r24.py"]
 
 train = dict(type="SemanticTangentCDCTrainer")
-find_unused_parameters = False
+# Radius head is intentionally inactive during the first warm-up epoch.
+find_unused_parameters = True
 enable_amp = False
 
 model = dict(
