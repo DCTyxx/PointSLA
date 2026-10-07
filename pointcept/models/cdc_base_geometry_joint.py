@@ -102,9 +102,18 @@ class CDCBaseGeometryJointSegmentor(CDCBaseGeometrySegmentor):
         self._check_base_only_labels(labels)
 
         if self._backbone_is_frozen:
+            # Important: the outer trainer runs under AMP. In our frozen warm-up
+            # the PTv3 backbone is also in eval mode, and spconv's implicit-GEMM
+            # tuner can fail for the eval+autocast(fp16) path with
+            # ``can't find suitable algorithm for 0``. The frozen backbone does
+            # not need mixed precision for speed/gradients, so keep this path in
+            # fp32 while preserving eval mode and true parameter/buffer freezing.
             with torch.no_grad():
-                point = self.backbone(Point(input_dict))
+                with torch.cuda.amp.autocast(enabled=False):
+                    point = self.backbone(Point(input_dict))
         else:
+            # Once PTv3 is unfrozen we intentionally reuse the original GFS-VL
+            # AMP training path. spconv then sees the normal training-mode path.
             point = self.backbone(Point(input_dict))
         feature = point.feat if isinstance(point, Point) else point
 
