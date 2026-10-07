@@ -9,6 +9,10 @@ base validation split:
 - TAS: Tangent Alignment Score.
 - GDG: Geometry Discrimination Gap.
 - SVR: Semantic Valid Rate.
+
+For checkpoint selection, TAS is the primary Step-1 metric. ``model_best.pth``
+is therefore selected only from held-out base validation TAS; GDG and SVR stay
+as diagnostics. ``model_last.pth`` is still written for resume/recovery.
 """
 
 import torch
@@ -271,7 +275,9 @@ class CDCBaseGeometryTrainer(Trainer):
 
             same_dist = (features[same_idx] - z).square().sum(dim=1)
             k_intra = min(knn, same_idx.numel())
-            nearest_same = same_idx[torch.topk(same_dist, k=k_intra, largest=False).indices]
+            nearest_same = same_idx[
+                torch.topk(same_dist, k=k_intra, largest=False).indices
+            ]
             intra_residual = features[nearest_same] - z
             if intra_residual.shape[0] < rank:
                 continue
@@ -354,10 +360,7 @@ class CDCBaseGeometryTrainer(Trainer):
             return False
         interval = max(1, int(eval_cfg.get("interval", 5)))
         epoch_number = self.epoch + 1
-        return (
-            epoch_number % interval == 0
-            or epoch_number == self.max_epoch
-        )
+        return epoch_number % interval == 0 or epoch_number == self.max_epoch
 
     @torch.no_grad()
     def _evaluate_base_geometry(self):
@@ -389,15 +392,31 @@ class CDCBaseGeometryTrainer(Trainer):
             self.writer.add_scalar("cdc_geometry/TAS", tas, step)
             self.writer.add_scalar("cdc_geometry/GDG", gdg, step)
             self.writer.add_scalar("cdc_geometry/SVR", svr, step)
+        return tas, gdg, svr
 
     def after_epoch(self):
-        super().after_epoch()
-        if not self._should_run_geometry_eval():
-            return
+        run_geometry_eval = self._should_run_geometry_eval()
+        original_evaluate_flag = bool(self.cfg.evaluate)
 
-        # Geometry evaluation is intentionally rank-0-only. Other ranks wait so
-        # the next training epoch starts with all workers synchronized.
-        comm.synchronize()
-        if comm.is_main_process():
-            self._evaluate_base_geometry()
-        comm.synchronize()
+        # Run the base-only geometry evaluation BEFORE CheckpointSaver. On
+        # geometry-eval epochs, expose TAS through the standard checkpoint metric
+        # interface so CheckpointSaver writes model_best.pth for the highest TAS.
+        if run_geometry_eval:
+            comm.synchronize()
+            if comm.is_main_process():
+                tas, gdg, svr = self._evaluate_base_geometry()
+                self.comm_info["current_metric_value"] = float(tas)
+                self.comm_info["current_metric_name"] = "CDC_TAS"
+                self.logger.info(
+                    "Step-1 checkpoint selection metric | "
+                    f"CDC_TAS: {tas:.4f} (GDG: {gdg:.4f}, SVR: {svr:.4f})"
+                )
+            comm.synchronize()
+            # There is no SemSegEvaluator in the Step-1 hook list. Temporarily
+            # enabling this flag only tells CheckpointSaver to compare CDC_TAS.
+            self.cfg.evaluate = True
+
+        try:
+            super().after_epoch()
+        finally:
+            self.cfg.evaluate = original_evaluate_flag
