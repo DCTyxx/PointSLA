@@ -15,6 +15,12 @@ _base_ = ["./semseg-pt-v3m1-0-cdcbase.py"]
 # frozen model, so no dynamic-unfreeze handling is needed.
 find_unused_parameters = False
 
+# Frozen PTv3 runs in eval mode. On the current spconv build, eval-mode sparse
+# convolution under outer AMP can fail during implicit-GEMM autotuning with
+# "can't find suitable algorithm for 0". Keep this Step-1 configuration fully
+# FP32. CDC geometry calculations are already intended to run in FP32 anyway.
+enable_amp = False
+
 model = dict(
     type="CDCBaseGeometrySegmentor",
     freeze_backbone=True,
