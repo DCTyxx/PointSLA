@@ -15,12 +15,19 @@ class GFS_VL_RMM_CDC_Trainer(GFS_VL_Trainer):
                 input_dict[key] = value.cuda(non_blocking=True)
 
         # Keep the baseline pseudo-label construction and cosine semantic
-        # matching unchanged.  RMM acts on the trainable PTv3 representation.
+        # matching unchanged. RMM acts on the trainable PTv3 representation.
         new_target = self.target_calibrate(input_dict)
 
         with torch.cuda.amp.autocast(enabled=self.cfg.enable_amp):
             output_dict = self.model(input_dict)
             seg_logits = output_dict.pop("seg_logits")
+
+            # Large feature tensors are useful inside the forward pass but must
+            # not be forwarded to InformationWriter: that hook expects every
+            # entry in model_output_dict to be scalar and calls `.item()`.
+            output_dict.pop("backbone_feat", None)
+            output_dict.pop("geometry_feat", None)
+
             criteria = (
                 self.model.module.criteria
                 if comm.get_world_size() > 1
