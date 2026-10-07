@@ -1,26 +1,37 @@
-# Step 1: CDC Base Geometry Pretraining
+# Step 1: Text-Constrained CDC Base Geometry Learning
 
-This branch adds the first stage of the proposed manifold-expansion pipeline on
-top of the **original GFS-VL baseline**. It does not contain novel/few-shot
-feature generation logic.
+This branch adds Step 1 of the proposed manifold-expansion pipeline on top of
+the **original GFS-VL baseline**. It intentionally contains no novel/few-shot
+feature-generation logic.
 
 ## Goal
 
 Use abundant base-class data to learn a transferable CDC/Riemannian local
-geometry prior in the final PTv3 point-feature space, while a **frozen CLIP
-text space** acts as a stable semantic prior that discourages CDC directions
-from destroying class semantics.
+geometry prior in the final PTv3 point-feature space. A **frozen CLIP text
+space** is used as a stable semantic prior so that learned CDC directions do
+not easily destroy class semantics.
 
-Role split:
+The recommended implementation uses a freeze-then-unfreeze schedule:
 
-- **PTv3 (frozen):** original GFS-VL point representation.
-- **CDC head (trainable):** learns low-rank local CDC factor `U(z,h)`, with
-  `Gamma = U U^T`.
-- **Semantic projector (trainable):** maps 64-D PTv3 features to 512-D CLIP
-  text space.
-- **CLIP text encoder/prototypes (frozen):** constrain CDC directional probes.
-- **Original segmentation head (frozen):** kept only for checkpoint
-  compatibility and not used to supervise CDC geometry.
+- **Epochs 1-5:** PTv3 is frozen. Train CDC and the PTv3-to-CLIP semantic bridge.
+- **Epoch 6 onward:** PTv3 is unfrozen and jointly optimized with a 10x smaller
+  learning rate than CDC/projector.
+- **Original base segmentation head:** frozen, but its CE + Lovasz objective
+  anchors PTv3 after unfreezing.
+- **CLIP text encoder/prototypes:** always frozen.
+
+## Strict base-only protocol
+
+Step 1 may use only:
+
+- base-class training/validation point clouds;
+- base-class GT labels;
+- base-class names encoded by the frozen CLIP text encoder.
+
+Step 1 explicitly forbids registration/few-shot sets, novel GT labels, novel
+pseudo labels/prototypes, and novel class names/text embeddings. The trainer
+contains runtime guards for these conditions. Hyper-parameter selection should
+also use base-only held-out diagnostics rather than novel few-shot mIoU.
 
 ## Objectives
 
@@ -32,19 +43,21 @@ For a clean base feature `z`, sample a bandwidth and Gaussian probe:
 z_h = z + h * eps
 ```
 
-The CDC head predicts rank-`r` factor `U`. Training uses the exact low-rank
-Frobenius objective equivalent to the conditional metric-matching target, so a
-full `D x D` target matrix is never materialized.
+The CDC head predicts a rank-`r` factor `U`, with local metric/covariance factor
+`Gamma = U U^T`. Training uses the low-rank Frobenius objective equivalent to
+the conditional metric-matching target, avoiding explicit `D x D` target
+materialization.
 
 ### 2. Frozen-text semantic bridge
 
-The semantic projector is trained on clean base features using the GT base
-class and its fixed CLIP text prototype. This only builds a bridge into the
-fixed semantic coordinate system; PTv3 is not updated.
+A trainable semantic projector maps the 64-D PTv3 point feature to the 512-D
+CLIP text space. Only base-class text prototypes are encoded and they remain
+fixed.
 
 ### 3. Text-constrained CDC directions
 
-After a short warm-up, sample a random direction from the CDC span:
+After the 5-epoch warm-up, directions sampled from the CDC span are probed in
+both signs:
 
 ```text
 delta = normalize(U a)
@@ -52,47 +65,123 @@ z+ = z + radius * delta
 z- = z - radius * delta
 ```
 
-For this loss, the projector parameters are detached. Therefore the projector
-cannot move merely to make an unsafe CDC direction look valid; gradients act
-on CDC. A virtual probe is penalized when either its GT-text similarity or its
-GT-vs-other-text margin drops beyond a tolerance.
+A probe is penalized when either its GT-text similarity or its GT-vs-other-base
+text margin drops beyond the configured tolerance. For this directional loss,
+projector parameters are detached so the semantic bridge cannot simply move to
+make an unsafe CDC direction appear valid.
 
-## Run
+### 4. Base segmentation anchor after PTv3 unfreezing
 
-The default config expects the original GFS-VL ScanNet base checkpoint at:
+The original base segmentation head stays frozen, while CE + Lovasz loss
+backpropagates into PTv3 after epoch 5. This prevents CDC/text optimization from
+arbitrarily distorting the original task representation.
+
+## Three Step-1 CDC diagnostics
+
+The recommended joint config evaluates only three primary CDC metrics on the
+held-out **base validation split**, every 5 epochs and at the final epoch.
+
+### TAS - Tangent Alignment Score (higher is better)
+
+For each held-out base anchor, build an empirical local tangent basis from the
+same-class nearest-neighbor residuals using SVD. Compare it with the CDC
+subspace:
+
+```text
+TAS = (1/r) * || Q_cdc^T Q_emp ||_F^2
+```
+
+TAS directly measures whether CDC principal directions agree with real local
+base-class feature variation.
+
+### GDG - Geometry Discrimination Gap (higher is better)
+
+Project held-out same-class and different-class residuals into the CDC
+subspace:
+
+```text
+GDG = IntraEVR - InterEVR
+```
+
+A high GDG means the CDC subspace explains class-internal variation better than
+cross-class variation.
+
+### SVR - Semantic Valid Rate (higher is better)
+
+Use normalized CDC singular directions with a fixed relative probe radius, in
+both positive and negative directions. A probe is valid only when both its
+GT-text similarity and GT-vs-other-base margin remain within tolerance. Using
+normalized fixed-radius directions prevents a collapsed CDC factor from
+trivially achieving high SVR.
+
+Training logs report exactly:
+
+```text
+CDC geometry eval (BASE-ONLY) | TAS: ... | GDG: ... | SVR: ...
+```
+
+TensorBoard keys are:
+
+```text
+cdc_geometry/TAS
+cdc_geometry/GDG
+cdc_geometry/SVR
+```
+
+## Recommended configuration
+
+```text
+configs/scannet/semseg-pt-v3m1-0-cdcbase-joint.py
+```
+
+Important defaults:
+
+```text
+CDC/projector LR : 1e-3
+PTv3 LR          : 1e-4
+PTv3 freeze      : first 5 epochs
+CDC rank         : 8
+geometry eval    : every 5 epochs
+TAS/GDG kNN      : 16
+SVR directions   : top 4 CDC singular directions, both signs
+```
+
+The config expects the original GFS-VL ScanNet base checkpoint at:
 
 ```text
 ./exp/scannet/ptv3_bk/model/model_best.pth
 ```
 
-Run:
+## Start Step 1
 
 ```bash
+git fetch origin
+git checkout feature/cdc-base-geometry-step1
+git pull origin feature/cdc-base-geometry-step1
+
+ls ./exp/scannet/ptv3_bk/model/model_best.pth
+
 sh scripts/train.sh -p python -d scannet \
-  -c semseg-pt-v3m1-0-cdcbase \
-  -n cdc_base_geometry_step1 -g 4
+  -c semseg-pt-v3m1-0-cdcbase-joint \
+  -n cdc_base_geometry_step1_joint -g 4
 ```
 
-## Logged diagnostics
+Expected behavior:
 
-- `cdc_loss`: conditional metric-matching loss.
-- `text_align_loss`: PTv3-to-frozen-CLIP bridge loss.
-- `text_acc`: base GT text-retrieval accuracy of that bridge.
-- `text_direction_loss`: semantic penalty on CDC-sampled directions.
-- `text_virtual_margin`: mean GT-vs-best-other text margin after probing.
-- `text_virtual_valid_rate`: fraction of probes satisfying both semantic
-  constraints.
-- `cdc_factor_energy`: factor-energy collapse/explosion diagnostic.
-- `relative_h`: sampled relative Gaussian bandwidth.
+- epochs 1-5: `backbone_frozen: 1`;
+- epoch 6 onward: PTv3 is unfrozen and `backbone_frozen: 0`;
+- text-direction loss becomes active after the warm-up;
+- epochs 5, 10, 15, ... and the final epoch print TAS/GDG/SVR;
+- checkpoints are written under the experiment's `model/` directory.
 
-## Output
+## Output for later few-shot use
 
-The checkpoint contains the unchanged baseline modules plus `cdc_head` and
-`semantic_projector`. The later few-shot stage can reuse the learned geometry
-through:
+The Step-1 checkpoint contains PTv3, the original segmentation head, the CDC
+head and semantic projector. The later few-shot stage can query the learned CDC
+geometry through:
 
 ```python
 factor = model.get_cdc_factor(feature, relative_h=0.02)
 ```
 
-Stage 2 is intentionally not implemented here.
+Step 2 is intentionally not implemented here yet.
