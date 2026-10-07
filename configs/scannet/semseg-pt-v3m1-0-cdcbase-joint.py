@@ -37,3 +37,12 @@ model = dict(
 # optimizer carries the params but does not update them.
 optimizer = dict(type="AdamW", lr=0.001, weight_decay=0.0001)
 param_dicts = [dict(keyword="backbone", lr=0.0001)]
+scheduler = dict(
+    type="OneCycleLR",
+    # build_optimizer creates [default, backbone] groups in this order.
+    max_lr=[0.001, 0.0001],
+    pct_start=0.1,
+    anneal_strategy="cos",
+    div_factor=10.0,
+    final_div_factor=1000.0,
+)
