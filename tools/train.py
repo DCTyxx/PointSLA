@@ -14,6 +14,7 @@ from pointcept.engines.train import TRAINERS
 import pointcept.engines.cdc_base_train  # noqa: F401
 import pointcept.engines.semantic_tangent_cdc_train  # noqa: F401
 import pointcept.engines.boundary_semantic_tangent_cdc_train  # noqa: F401
+import pointcept.engines.conservative_boundary_semantic_tangent_cdc_train  # noqa: F401
 from pointcept.engines.launch import launch
 
 
