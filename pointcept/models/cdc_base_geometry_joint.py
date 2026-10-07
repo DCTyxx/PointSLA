@@ -50,13 +50,15 @@ class CDCBaseGeometryJointSegmentor(CDCBaseGeometrySegmentor):
         self.seg_loss_weight = float(seg_loss_weight)
         self.criteria = build_criteria(criteria)
 
+        # Keep PTv3 parameters requiring gradients from construction time so DDP
+        # registers reducer hooks for them. During the warm-up we freeze PTv3 by
+        # eval mode + no_grad(), not by toggling requires_grad after DDP creation.
         self._backbone_is_frozen = True
         self._set_backbone_frozen(True)
 
     def _set_backbone_frozen(self, frozen):
         frozen = bool(frozen)
         self._backbone_is_frozen = frozen
-        self.backbone.requires_grad_(not frozen)
         if frozen:
             self.backbone.eval()
         elif self.training:
@@ -102,18 +104,15 @@ class CDCBaseGeometryJointSegmentor(CDCBaseGeometrySegmentor):
         self._check_base_only_labels(labels)
 
         if self._backbone_is_frozen:
-            # Important: the outer trainer runs under AMP. In our frozen warm-up
-            # the PTv3 backbone is also in eval mode, and spconv's implicit-GEMM
-            # tuner can fail for the eval+autocast(fp16) path with
-            # ``can't find suitable algorithm for 0``. The frozen backbone does
-            # not need mixed precision for speed/gradients, so keep this path in
-            # fp32 while preserving eval mode and true parameter/buffer freezing.
+            # The outer trainer runs under AMP. During the warm-up PTv3 is also
+            # in eval mode, and spconv's implicit-GEMM tuner can fail on the
+            # eval+autocast(fp16) path with ``can't find suitable algorithm for
+            # 0``. Keep the frozen backbone in fp32; it has no gradient anyway.
             with torch.no_grad():
                 with torch.cuda.amp.autocast(enabled=False):
                     point = self.backbone(Point(input_dict))
         else:
-            # Once PTv3 is unfrozen we intentionally reuse the original GFS-VL
-            # AMP training path. spconv then sees the normal training-mode path.
+            # After warm-up reuse the original GFS-VL AMP training path.
             point = self.backbone(Point(input_dict))
         feature = point.feat if isinstance(point, Point) else point
 
