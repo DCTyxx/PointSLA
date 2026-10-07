@@ -14,6 +14,7 @@ from pointcept.engines.train import TRAINERS
 # Import custom trainers for registry side effects.
 from pointcept.engines import learnable_fisher_trainer  # noqa: F401
 from pointcept.engines import learnable_fisher_region_trainer  # noqa: F401
+from pointcept.engines import rmm_cdc_trainer  # noqa: F401
 from pointcept.engines.launch import launch
 
 
