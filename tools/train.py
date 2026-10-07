@@ -11,6 +11,7 @@ from pointcept.engines.defaults import (
     default_setup,
 )
 from pointcept.engines.train import TRAINERS
+import pointcept.engines.cdc_base_train  # noqa: F401
 from pointcept.engines.launch import launch
 
 
