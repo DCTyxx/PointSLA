@@ -33,8 +33,18 @@ model = dict(
             ignore_index=-1,
         ),
     ],
-    # Keep the existing CDC/text settings from the base config. The text
-    # direction constraint is also enabled after its 5-epoch warm-up.
+    # Epoch-5 diagnostics showed that a 5% probe radius with 0.02 cosine/margin
+    # tolerance saturated SVR at 1.0 and made text_direction_loss exactly zero.
+    # Tighten the semantic safety band and use a larger, still-local 10% feature
+    # probe so the frozen text prior actually supplies a directional gradient.
+    # The direction loss weight is reduced accordingly to keep CDC geometry as
+    # the primary objective rather than letting text dominate it.
+    text_constraint=dict(
+        direction_loss_weight=0.10,
+        positive_tolerance=0.005,
+        margin_tolerance=0.005,
+        probe_radius=0.10,
+    ),
 )
 
 # CDC head + semantic projector: 1e-3.
@@ -64,5 +74,8 @@ cdc_geometry_eval = dict(
     knn=16,
     inter_knn=16,
     svr_directions=4,
-    num_workers=4,
+    # Geometry evaluation runs inside the main DDP worker on rank 0. Avoid
+    # spawning another multiprocessing DataLoader here; on the current server it
+    # can emit an otherwise non-fatal worker-aborted exception during teardown.
+    num_workers=0,
 )
