@@ -12,8 +12,17 @@ _base_ = ["./semseg-pt-v3m1-0-gfsregistrain_k1.py"]
 k_shot = 1
 regis_train_list = ["regis1"]
 
-# Full Stage-1 best checkpoint. BackboneLoader(strict=False) loads every matching
-# key; only the newly introduced novel_seg_head is expected to be missing.
+# Strict Phase-1 loader verifies that every Stage-1 key is restored except the
+# newly introduced novel_seg_head, and checks PTv3 trainability / CDC freezing.
+hooks = [
+    dict(type="Stage2Phase1CheckpointLoader"),
+    dict(type="IterationTimer", warmup_iter=2),
+    dict(type="InformationWriter"),
+    dict(type="CheckpointSaver_MultiRegis", save_freq=None),
+    dict(type="GFS_MultiregTrain_PreciseEvaluator", test_last=True),
+]
+
+# Full Stage-1 best checkpoint.
 backbone_weight = (
     "./exp/scannet/conservative_boundary_semantic_tangent_r24_v1/"
     "model/model_best.pth"
