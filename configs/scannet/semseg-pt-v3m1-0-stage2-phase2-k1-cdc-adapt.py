@@ -1,13 +1,13 @@
 """Stage-2 Phase-2: adapt CDC on each frozen K=1 task-specific PTv3 space.
 
-This config is intentionally regis-agnostic.  The launcher supplies the matching
+This config is intentionally regis-agnostic. The launcher supplies the matching
 Phase-1 checkpoint and registration seed for regis1..regis5, so one command can
 run all five splits without sharing state between them.
 """
 
 _base_ = ["./semseg-pt-v3m1-0-stage2-phase1-k1-frozen-cdc.py"]
 
-# Phase 2 no longer needs the GFS-VL 3D-VLM pseudo-label trainer.  It uses only
+# Phase 2 no longer needs the GFS-VL 3D-VLM pseudo-label trainer. It uses only
 # Base GT + inserted K-shot Novel GT already present in ScanNetDataset_REGISTrain.
 train = dict(type="DefaultTrainer")
 
@@ -20,13 +20,16 @@ hooks = [
     dict(type="Stage2Phase2CheckpointLoader"),
     dict(type="IterationTimer", warmup_iter=2),
     dict(type="InformationWriter"),
+    # Persist epoch-average geometry metrics in JSON. The all-regis launcher
+    # aggregates the five final JSON files into mean/std CSV + JSON summaries.
+    dict(type="Stage2Phase2MetricSummary"),
     dict(type="CheckpointSaver", save_freq=None),
 ]
 
 evaluate = False
 find_unused_parameters = False
 
-# Frozen PTv3 runs in eval mode.  Keep Phase 2 in fp32, matching the Stage-1
+# Frozen PTv3 runs in eval mode. Keep Phase 2 in fp32, matching the Stage-1
 # geometry setup and avoiding the known eval-mode spconv AMP autotuning issue.
 enable_amp = False
 
@@ -34,7 +37,7 @@ model = dict(
     type="Stage2Phase2CDCAdaptSegmentor",
 )
 
-# Default values correspond to regis1.  The all-regis launcher changes only
+# Default values correspond to regis1. The all-regis launcher changes only
 # ``seed`` to 10/20/30/40/50 while keeping K=1 and the same insertion protocol.
 data = dict(
     train=dict(
