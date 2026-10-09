@@ -52,7 +52,15 @@ epoch = 10
 eval_epoch = 10
 optimizer = dict(type="AdamW", lr=1.0e-4, weight_decay=1.0e-4)
 param_dicts = None
+
+# IMPORTANT: Phase-1 inherits a MultiStepLR with ``milestones`` and ``gamma``.
+# The config system recursively merges dictionaries unless ``_delete_=True`` is
+# set. Without deleting the inherited scheduler dict those MultiStepLR-only
+# fields are passed into OneCycleLR and cause:
+#   OneCycleLR.__init__() got an unexpected keyword argument 'milestones'
+# Replace the scheduler dictionary completely here.
 scheduler = dict(
+    _delete_=True,
     type="OneCycleLR",
     max_lr=1.0e-4,
     pct_start=0.1,
