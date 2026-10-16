@@ -9,8 +9,8 @@ CDC prior.  Phase 2 reverses the optimization roles:
 - semantic projector and safe-radius head: frozen.
 
 Only trusted labels already present in ``input_dict['segment']`` are used.  With
-``ScanNetDataset_REGISTrain`` these are Base GT plus inserted K-shot Novel GT;
-background/unknown points remain -1 and are ignored by tangent construction.
+registration training datasets these are Base GT plus inserted K-shot Novel GT;
+background/unknown points remain -1 and are removed before tangent construction.
 No 3D-VLM pseudo labels are used in this phase.
 """
 
@@ -27,7 +27,7 @@ class Stage2Phase2CDCAdaptSegmentor(Stage2Phase1FrozenCDCRegisSegmentor):
     """Frozen task backbone + trainable CDC tangent adaptation."""
 
     def __init__(self, **kwargs):
-        # Build the exact Phase-1 hierarchy first.  This preserves parameter names
+        # Build the exact Phase-1 hierarchy first. This preserves parameter names
         # so every regis-specific Phase-1 checkpoint can be loaded strictly.
         super().__init__(**kwargs)
 
@@ -42,8 +42,7 @@ class Stage2Phase2CDCAdaptSegmentor(Stage2Phase1FrozenCDCRegisSegmentor):
         # CDC alone adapts to the fixed task-specific 64-D feature space.
         self.cdc_head.requires_grad_(True)
 
-        # These Stage-1 semantic-side modules are deliberately held fixed in the
-        # first Phase-2 implementation.  They are not executed by the loss below.
+        # Stage-1 semantic-side modules remain fixed and are not in this loss.
         self.semantic_projector.requires_grad_(False)
         self.safe_radius_head.requires_grad_(False)
 
@@ -78,7 +77,7 @@ class Stage2Phase2CDCAdaptSegmentor(Stage2Phase1FrozenCDCRegisSegmentor):
             )
 
     def train(self, mode=True):
-        # Bypass Phase-1 train(), which intentionally freezes CDC.  Set recursive
+        # Bypass Phase-1 train(), which intentionally freezes CDC. Set recursive
         # mode first, then restore the intended optimization/eval state explicitly.
         nn.Module.train(self, mode)
         self.backbone.eval()
@@ -97,11 +96,7 @@ class Stage2Phase2CDCAdaptSegmentor(Stage2Phase1FrozenCDCRegisSegmentor):
         return value.new_zeros(())
 
     def _phase2_tangent_objective(self, clean, labels):
-        """QR Tangent-CDC objective with Base/Novel diagnostics.
-
-        This is the same geometric objective used by Stage 1, evaluated in the
-        *current regis-specific, task-adapted* frozen PTv3 feature space.
-        """
+        """QR Tangent-CDC objective with Base/Novel diagnostics."""
         bank_idx = self._balanced_unique_indices(labels, self.tangent_max_bank_points)
         bank = clean[bank_idx]
         bank_labels = labels[bank_idx]
@@ -209,9 +204,13 @@ class Stage2Phase2CDCAdaptSegmentor(Stage2Phase1FrozenCDCRegisSegmentor):
         if not bool(valid.any().item()):
             raise RuntimeError("Phase-2 batch contains no trusted GT points")
 
+        # Critical: remove unknown/background (-1) points before the geometry
+        # bank is built. Otherwise -1 is treated as a Base class by the numeric
+        # split test and can contaminate both tangent learning and diagnostics.
         with torch.cuda.amp.autocast(enabled=False):
-            clean = feature.detach().float()
-            geometry = self._phase2_tangent_objective(clean, labels)
+            clean = feature.detach().float()[valid]
+            clean_labels = labels[valid]
+            geometry = self._phase2_tangent_objective(clean, clean_labels)
             loss = (
                 self.tangent_loss_weight * geometry["tangent_loss"]
                 + self.tangent_disc_weight * geometry["disc_loss"]
