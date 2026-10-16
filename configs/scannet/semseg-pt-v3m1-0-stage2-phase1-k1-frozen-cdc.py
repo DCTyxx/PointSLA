@@ -8,9 +8,11 @@ radius head remain frozen and do not participate in the loss.
 
 _base_ = ["./semseg-pt-v3m1-0-gfsregistrain_k1.py"]
 
-# Use one registration split first to validate the Phase-1 pipeline.
+# Follow the original GFS-VL protocol and train/evaluate all five registration
+# splits. The corresponding seeds are defined by data.regis1..data.regis5 in
+# the inherited baseline config.
 k_shot = 1
-regis_train_list = ["regis1"]
+regis_train_list = ["regis1", "regis2", "regis3", "regis4", "regis5"]
 
 # Strict Phase-1 loader verifies that every Stage-1 key is restored except the
 # newly introduced novel_seg_head, and checks PTv3 trainability / CDC freezing.
