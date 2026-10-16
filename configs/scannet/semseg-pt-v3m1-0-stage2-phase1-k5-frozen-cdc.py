@@ -5,24 +5,14 @@ head and the geometry stack. During this phase PTv3/base/novel segmentation
 heads follow the original GFS-VL 5-shot registration training, while CDC, the
 semantic projector and the safe-radius head remain frozen and do not
 participate in the loss.
-
-Important: run one registration split per process. ``GFS_VL_Trainer`` updates
-one model sequentially when multiple entries are placed in ``regis_train_list``;
-that would make regis2 inherit the adapted weights of regis1, etc. Keeping a
-single registration here preserves the required independent provenance from
-the same Stage-1 checkpoint for every 5-shot split. A launcher can override
-``regis_train_list`` to ["regis2"], ..., ["regis5"] in separate runs.
 """
 
 _base_ = ["./semseg-pt-v3m1-0-gfsregistrain_k5.py"]
 
 # 5-shot support protocol. The inherited registration datasets use this value
-# to read/generate sc200_regis_5_{10,20,30,40,50}.txt.
+# to read/generate the five prescribed registration splits.
 k_shot = 5
-
-# Default to regis1 only. Run regis1..regis5 independently from the same
-# Stage-1 checkpoint rather than chaining task adaptation across registrations.
-regis_train_list = ["regis1"]
+regis_train_list = ["regis1", "regis2", "regis3", "regis4", "regis5"]
 
 # Strict Phase-1 loader restores every Stage-1 key except the newly introduced
 # novel_seg_head, and verifies PTv3/base-head trainability and CDC freezing.
