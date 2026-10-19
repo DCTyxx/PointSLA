@@ -56,6 +56,16 @@ class MergedStage1Phase2GeometryTrainer(
             )
 
     def _build_and_inject_text_prior(self):
+        # Phase-1 configs did not need a text-encoder config because Stage-1
+        # checkpoints already contained text buffers. The merged stage learns the
+        # semantic projector from scratch, so provide the repository's standard
+        # GFS-VL CLIP config when the inherited task config does not define one.
+        if not hasattr(self.cfg, "cdc_text_cfg_file"):
+            self.cfg.cdc_text_cfg_file = (
+                "./pointcept/models/PLA/tools/cfgs/scannet200_models/zs/"
+                "spconv_clip_caption_openscene.yaml"
+            )
+
         # Reuse the original leakage-guarded CLIP construction. Since configs set
         # data.names to Base classes only, no Novel text prototype can be encoded.
         super()._build_and_inject_text_prior()
