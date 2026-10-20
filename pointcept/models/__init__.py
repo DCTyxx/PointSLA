@@ -9,6 +9,7 @@ from .conservative_boundary_semantic_tangent_cdc_base_geometry import *
 from .stage2_phase1_frozen_cdc import *
 from .stage2_phase2_cdc_adapt import *
 from .stage2_merged_geometry import *
+from .stage2_taskspace_stage1 import *
 from .stage2_phase3_cdc_aug import *
 
 # Backbones
