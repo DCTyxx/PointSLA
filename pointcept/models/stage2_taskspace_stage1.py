@@ -54,6 +54,12 @@ class Stage2TaskSpaceStage1Segmentor(
         if num_novel_classes <= 0:
             raise ValueError("num_novel_classes must be positive")
 
+        # The inherited validated Stage-1 config already contains these two
+        # fields.  Remove them from kwargs before forcing the task-space stage to
+        # stay frozen, otherwise Python would receive duplicate keyword values.
+        kwargs.pop("freeze_backbone", None)
+        kwargs.pop("freeze_seg_head", None)
+
         super().__init__(
             num_classes=num_base_classes,
             backbone_out_channels=backbone_out_channels,
