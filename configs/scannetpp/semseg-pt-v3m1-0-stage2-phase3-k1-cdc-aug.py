@@ -14,6 +14,16 @@ hooks = [
     dict(type="Stage2Phase3GFSEvaluator"),
     dict(type="CheckpointSaver", save_freq=None),
     dict(type="Stage2Phase3PreciseEvaluator", test_last=False),
+    # Reload model_best and export one deterministic train/val feature snapshot.
+    # The direction-ablation launcher later keeps only the best-HM regis copy.
+    dict(
+        type="Stage2Phase3BestFeaturePairExporter",
+        output_dir="best_feature_pairs",
+        export_train=True,
+        export_val=True,
+        export_seed=3407,
+        num_workers=0,
+    ),
 ]
 
 evaluate = True
