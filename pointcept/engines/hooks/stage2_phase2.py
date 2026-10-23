@@ -5,6 +5,7 @@ import os
 from collections import OrderedDict
 
 import torch
+import torch.distributed as dist
 
 import pointcept.utils.comm as comm
 from .builder import HOOKS
@@ -88,31 +89,110 @@ class Stage2Phase2CheckpointLoader(HookBase):
 
 @HOOKS.register_module()
 class Stage2Phase2MetricSummary(HookBase):
-    """Save epoch-wise and final Phase-2 metrics in machine-readable JSON.
+    """Save exact anchor-weighted Phase-2 LSL metrics in JSON.
 
-    ``InformationWriter`` already reports batch/epoch values in ``train.log``.
-    This hook preserves the epoch averages so the five registration splits can
-    be aggregated automatically into mean/std statistics by the launcher.
+    The five paper-facing LSL diagnostics are aggregated separately for
+    Overall/Base/Novel anchors:
+
+    1. TAS (higher is better)
+    2. Intra-EVR (higher is better)
+    3. Inter-EVR (lower is better)
+    4. GDG = Intra-EVR - Inter-EVR (higher is better)
+    5. Mean Principal Angle in degrees (lower is better)
+
+    Aggregation is anchor-weighted rather than a simple mean over batches. In
+    distributed training, per-rank metric sums/counts are all-reduced before
+    epoch accumulation, so the reported values cover all GPUs exactly.
     """
 
-    METRICS = (
+    BASIC_METRICS = (
         "loss",
         "tangent_loss",
         "discrimination_loss",
-        "train_tas",
-        "train_gdg",
-        "base_tas",
-        "base_gdg",
-        "novel_tas",
-        "novel_gdg",
-        "num_base_anchors",
-        "num_novel_anchors",
         "basis_orth_error",
         "cdc_factor_energy",
     )
 
+    LSL_FIELDS = (
+        "tas",
+        "intra_evr",
+        "inter_evr",
+        "gdg",
+        "principal_angle_deg",
+    )
+
     def __init__(self):
         self.records = []
+        self.lsl_records = []
+        self._epoch_lsl = None
+
+    def before_epoch(self):
+        self._epoch_lsl = {
+            group: {
+                "count": 0.0,
+                **{field: 0.0 for field in self.LSL_FIELDS},
+            }
+            for group in ("overall", "base", "novel")
+        }
+
+    @staticmethod
+    def _metric_key(group, field):
+        if group == "overall":
+            prefix = "train"
+        else:
+            prefix = group
+        return f"{prefix}_{field}"
+
+    @staticmethod
+    def _get_count(output, group):
+        base_count = output["num_base_anchors"].detach().float()
+        novel_count = output["num_novel_anchors"].detach().float()
+        if group == "base":
+            return base_count
+        if group == "novel":
+            return novel_count
+        return base_count + novel_count
+
+    def after_step(self):
+        output = self.trainer.comm_info.get("model_output_dict", None)
+        if output is None:
+            return
+
+        required = ["num_base_anchors", "num_novel_anchors"]
+        required += [
+            self._metric_key(group, field)
+            for group in ("overall", "base", "novel")
+            for field in self.LSL_FIELDS
+        ]
+        missing = [key for key in required if key not in output]
+        if missing:
+            raise KeyError(
+                "Phase-2 LSL summary is missing model outputs: "
+                f"{missing}"
+            )
+
+        for group in ("overall", "base", "novel"):
+            count = self._get_count(output, group)
+            packed = [
+                output[self._metric_key(group, field)].detach().float() * count
+                for field in self.LSL_FIELDS
+            ]
+            packed.append(count)
+            packed = torch.stack(packed)
+
+            if comm.get_world_size() > 1:
+                if not dist.is_available() or not dist.is_initialized():
+                    raise RuntimeError(
+                        "Distributed Phase-2 LSL aggregation requested but "
+                        "torch.distributed is not initialized"
+                    )
+                dist.all_reduce(packed, op=dist.ReduceOp.SUM)
+
+            packed = packed.cpu()
+            global_count = float(packed[-1].item())
+            self._epoch_lsl[group]["count"] += global_count
+            for idx, field in enumerate(self.LSL_FIELDS):
+                self._epoch_lsl[group][field] += float(packed[idx].item())
 
     def _collect_epoch_metrics(self):
         record = {
@@ -121,12 +201,57 @@ class Stage2Phase2MetricSummary(HookBase):
             ),
             "epoch": int(self.trainer.epoch + 1),
         }
-        for key in self.METRICS:
+
+        for key in self.BASIC_METRICS:
             try:
                 record[key] = float(self.trainer.storage.history(key).avg)
             except Exception:
                 continue
+
+        if self._epoch_lsl is None:
+            raise RuntimeError("Phase-2 LSL epoch accumulator was not initialized")
+
+        for group in ("overall", "base", "novel"):
+            count = self._epoch_lsl[group]["count"]
+            record[f"num_{group}_anchors"] = count
+            for field in self.LSL_FIELDS:
+                value = (
+                    self._epoch_lsl[group][field] / count
+                    if count > 0.0
+                    else 0.0
+                )
+                record[f"{group}_{field}"] = value
+
+        # Backward-compatible aliases expected by old result parsers.
+        record["train_tas"] = record["overall_tas"]
+        record["train_gdg"] = record["overall_gdg"]
+        record["base_tas"] = record["base_tas"]
+        record["base_gdg"] = record["base_gdg"]
+        record["novel_tas"] = record["novel_tas"]
+        record["novel_gdg"] = record["novel_gdg"]
+        record["num_base_anchors"] = record["num_base_anchors"]
+        record["num_novel_anchors"] = record["num_novel_anchors"]
         return record
+
+    def _to_lsl_payload(self, record):
+        groups = {}
+        for group in ("overall", "base", "novel"):
+            groups[group] = {
+                "TAS": record[f"{group}_tas"],
+                "Intra-EVR": record[f"{group}_intra_evr"],
+                "Inter-EVR": record[f"{group}_inter_evr"],
+                "GDG": record[f"{group}_gdg"],
+                "Mean-Principal-Angle-Deg": record[
+                    f"{group}_principal_angle_deg"
+                ],
+                "num_anchors": record[f"num_{group}_anchors"],
+            }
+        return {
+            "regis": record["regis"],
+            "epoch": record["epoch"],
+            "aggregation": "anchor_weighted_all_gpu",
+            "groups": groups,
+        }
 
     def _write_json(self, filename, payload):
         if not comm.is_main_process():
@@ -137,24 +262,26 @@ class Stage2Phase2MetricSummary(HookBase):
 
     def after_epoch(self):
         record = self._collect_epoch_metrics()
+        lsl_payload = self._to_lsl_payload(record)
+
         self.records.append(record)
+        self.lsl_records.append(lsl_payload)
         self._write_json("phase2_metrics_history.json", self.records)
         self._write_json("phase2_metrics_final.json", record)
+        self._write_json("phase2_lsl_metrics_history.json", self.lsl_records)
+        self._write_json("phase2_lsl_metrics_final.json", lsl_payload)
 
         if comm.is_main_process():
-            tracked = ", ".join(
-                f"{key}={record[key]:.6f}"
-                for key in (
-                    "train_tas",
-                    "train_gdg",
-                    "base_tas",
-                    "base_gdg",
-                    "novel_tas",
-                    "novel_gdg",
+            for group in ("overall", "base", "novel"):
+                self.trainer.logger.info(
+                    "Stage2-Phase2 LSL metrics "
+                    f"[{record['regis']}] epoch {record['epoch']} | "
+                    f"{group.upper()} | "
+                    f"TAS: {record[f'{group}_tas']:.6f} | "
+                    f"Intra-EVR: {record[f'{group}_intra_evr']:.6f} | "
+                    f"Inter-EVR: {record[f'{group}_inter_evr']:.6f} | "
+                    f"GDG: {record[f'{group}_gdg']:.6f} | "
+                    "MeanPrincipalAngle(deg): "
+                    f"{record[f'{group}_principal_angle_deg']:.6f} | "
+                    f"anchors: {int(record[f'num_{group}_anchors'])}"
                 )
-                if key in record
-            )
-            self.trainer.logger.info(
-                f"Stage2-Phase2 metrics [{record['regis']}] epoch "
-                f"{record['epoch']}: {tracked}"
-            )
