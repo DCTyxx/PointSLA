@@ -6,7 +6,10 @@ set -euo pipefail
 # Overall / Base / Novel:
 #   TAS, Intra-EVR, Inter-EVR, GDG, Mean Principal Angle (degrees).
 #
-# Default examples:
+# The default BATCH_SIZE=4 matches the per-GPU batch size of the standard
+# batch_size=12, 3-GPU Phase-2 runs. Override it if the original run differed.
+#
+# Examples:
 #   DATASETS=scannet200 K_LIST="1 5" GPU=0 bash scripts/run_split_phase2_lsl_posthoc_eval.sh
 #   DATASETS="scannet scannet200 scannetpp" K_LIST="1 5" GPU=0 bash scripts/run_split_phase2_lsl_posthoc_eval.sh
 
@@ -14,7 +17,7 @@ PYTHON_BIN="${PYTHON_BIN:-python}"
 GPU="${GPU:-0}"
 DATASETS="${DATASETS:-scannet200}"
 K_LIST="${K_LIST:-1 5}"
-BATCH_SIZE="${BATCH_SIZE:-12}"
+BATCH_SIZE="${BATCH_SIZE:-4}"
 NUM_WORKERS="${NUM_WORKERS:-6}"
 REUSE_COMPLETED="${REUSE_COMPLETED:-1}"
 
@@ -31,7 +34,6 @@ for dataset in "${DATASET_ARRAY[@]}"; do
     scannet|scannet200|scannetpp) ;;
     *) echo "[ERROR] Unsupported dataset: ${dataset}"; exit 1 ;;
   esac
-
 done
 
 for k in "${K_ARRAY[@]}"; do
