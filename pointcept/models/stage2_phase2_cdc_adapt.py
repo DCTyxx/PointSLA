@@ -1,18 +1,24 @@
 """Stage-2 Phase-2: adapt CDC to each task-adapted GFS-VL feature space.
 
 Phase 1 updates PTv3/base/novel segmentation heads while preserving the Stage-1
-CDC prior.  Phase 2 reverses the optimization roles:
+CDC prior. Phase 2 reverses the optimization roles:
 
 - task-adapted PTv3 backbone: frozen;
 - base and novel segmentation heads: frozen;
 - CDC geometry head: trainable;
 - semantic projector and safe-radius head: frozen.
 
-Only trusted labels already present in ``input_dict['segment']`` are used.  With
+Only trusted labels already present in ``input_dict['segment']`` are used. With
 registration training datasets these are Base GT plus inserted K-shot Novel GT;
 background/unknown points remain -1 and are removed before tangent construction.
 No 3D-VLM pseudo labels are used in this phase.
+
+In addition to the optimization losses, Phase 2 reports five LSL diagnostics for
+Overall/Base/Novel anchors: TAS, Intra-EVR, Inter-EVR, GDG, and mean principal
+angle (degrees) between the learned and empirical local subspaces.
 """
+
+import math
 
 import torch
 import torch.nn as nn
@@ -96,7 +102,7 @@ class Stage2Phase2CDCAdaptSegmentor(Stage2Phase1FrozenCDCRegisSegmentor):
         return value.new_zeros(())
 
     def _phase2_tangent_objective(self, clean, labels):
-        """QR Tangent-CDC objective with Base/Novel diagnostics."""
+        """QR Tangent-CDC objective with Base/Novel/Overall LSL diagnostics."""
         bank_idx = self._balanced_unique_indices(labels, self.tangent_max_bank_points)
         bank = clean[bank_idx]
         bank_labels = labels[bank_idx]
@@ -161,10 +167,13 @@ class Stage2Phase2CDCAdaptSegmentor(Stage2Phase1FrozenCDCRegisSegmentor):
         factor = self.cdc_head(anchors, relative_h * feature_rms)
         q = self._orthonormalize_factor(factor)
 
+        # TAS: average squared cosine between learned and empirical subspaces.
         overlap = torch.einsum("adr,adq->arq", q, q_emp)
         alignment = overlap.square().sum(dim=(1, 2)) / self.cdc_rank
         tangent_loss = 1.0 - alignment.mean()
 
+        # EVR and GDG: how much same-class vs different-class local variation the
+        # learned tangent subspace explains.
         intra_evr = self._orthonormal_projected_energy_ratio(
             q, intra_residual.detach()
         )
@@ -174,18 +183,44 @@ class Stage2Phase2CDCAdaptSegmentor(Stage2Phase1FrozenCDCRegisSegmentor):
         gap = intra_evr - inter_evr
         disc_loss = torch.relu(self.tangent_disc_margin - gap).mean()
 
+        # Mean principal angle gives an interpretable angular counterpart to TAS.
+        # q and q_emp are orthonormal, so singular values of Q^T Q_emp are the
+        # cosines of principal angles. This is diagnostic only (no gradient).
+        with torch.no_grad():
+            principal_cos = torch.linalg.svdvals(overlap.detach()).clamp(0.0, 1.0)
+            principal_angle_deg = (
+                torch.acos(principal_cos).mean(dim=1) * (180.0 / math.pi)
+            )
+
         base_mask = anchor_labels < self.num_base_classes
         novel_mask = anchor_labels >= self.num_base_classes
 
         return dict(
             tangent_loss=tangent_loss,
             disc_loss=disc_loss,
+            # Overall diagnostics. Keep train_tas/train_gdg names for backward
+            # compatibility with existing logs/scripts.
             train_tas=alignment.mean().detach(),
+            train_intra_evr=intra_evr.mean().detach(),
+            train_inter_evr=inter_evr.mean().detach(),
             train_gdg=gap.mean().detach(),
+            train_principal_angle_deg=principal_angle_deg.mean().detach(),
+            # Base diagnostics.
             base_tas=self._masked_mean_or_zero(alignment.detach(), base_mask),
+            base_intra_evr=self._masked_mean_or_zero(intra_evr.detach(), base_mask),
+            base_inter_evr=self._masked_mean_or_zero(inter_evr.detach(), base_mask),
             base_gdg=self._masked_mean_or_zero(gap.detach(), base_mask),
+            base_principal_angle_deg=self._masked_mean_or_zero(
+                principal_angle_deg, base_mask
+            ),
+            # Novel diagnostics.
             novel_tas=self._masked_mean_or_zero(alignment.detach(), novel_mask),
+            novel_intra_evr=self._masked_mean_or_zero(intra_evr.detach(), novel_mask),
+            novel_inter_evr=self._masked_mean_or_zero(inter_evr.detach(), novel_mask),
             novel_gdg=self._masked_mean_or_zero(gap.detach(), novel_mask),
+            novel_principal_angle_deg=self._masked_mean_or_zero(
+                principal_angle_deg, novel_mask
+            ),
             num_base_anchors=base_mask.sum().to(dtype=clean.dtype),
             num_novel_anchors=novel_mask.sum().to(dtype=clean.dtype),
             factor=factor,
@@ -205,8 +240,7 @@ class Stage2Phase2CDCAdaptSegmentor(Stage2Phase1FrozenCDCRegisSegmentor):
             raise RuntimeError("Phase-2 batch contains no trusted GT points")
 
         # Critical: remove unknown/background (-1) points before the geometry
-        # bank is built. Otherwise -1 is treated as a Base class by the numeric
-        # split test and can contaminate both tangent learning and diagnostics.
+        # bank is built. Otherwise -1 can contaminate tangent learning/diagnostics.
         with torch.cuda.amp.autocast(enabled=False):
             clean = feature.detach().float()[valid]
             clean_labels = labels[valid]
@@ -229,12 +263,24 @@ class Stage2Phase2CDCAdaptSegmentor(Stage2Phase1FrozenCDCRegisSegmentor):
             "loss": loss,
             "tangent_loss": geometry["tangent_loss"].detach(),
             "discrimination_loss": geometry["disc_loss"].detach(),
+            # Overall LSL metrics.
             "train_tas": geometry["train_tas"],
+            "train_intra_evr": geometry["train_intra_evr"],
+            "train_inter_evr": geometry["train_inter_evr"],
             "train_gdg": geometry["train_gdg"],
+            "train_principal_angle_deg": geometry["train_principal_angle_deg"],
+            # Base LSL metrics.
             "base_tas": geometry["base_tas"],
+            "base_intra_evr": geometry["base_intra_evr"],
+            "base_inter_evr": geometry["base_inter_evr"],
             "base_gdg": geometry["base_gdg"],
+            "base_principal_angle_deg": geometry["base_principal_angle_deg"],
+            # Novel LSL metrics.
             "novel_tas": geometry["novel_tas"],
+            "novel_intra_evr": geometry["novel_intra_evr"],
+            "novel_inter_evr": geometry["novel_inter_evr"],
             "novel_gdg": geometry["novel_gdg"],
+            "novel_principal_angle_deg": geometry["novel_principal_angle_deg"],
             "num_base_anchors": geometry["num_base_anchors"],
             "num_novel_anchors": geometry["num_novel_anchors"],
             "basis_orth_error": basis_orth_error.detach(),
