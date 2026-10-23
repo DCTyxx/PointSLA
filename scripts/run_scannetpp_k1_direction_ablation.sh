@@ -1,32 +1,37 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ScanNet++ K=1 Phase-3 augmentation-direction ablation.
+# ScanNet++ K=1 Phase-3 augmentation-direction ablation + best feature export.
 #
-# Fixed across all four settings:
+# Fixed across all settings:
 #   - existing split_phase2_k1 checkpoint per registration;
-#   - same Novel-head-only Phase-3 refinement;
+#   - Novel-head-only Phase-3 refinement;
 #   - same optimizer/scheduler/epochs;
-#   - same M=4 virtual samples for augmentation modes;
-#   - same Base-only conservative P05 radius used by the split Phase-3 baseline;
-#   - same virtual loss weight = 0.5.
+#   - M=4 virtual samples for augmentation modes;
+#   - same Base-only conservative P05 radius;
+#   - virtual loss weight = 0.5.
 #
-# Only the direction source changes:
+# Modes:
 #   real_only       : no virtual feature
 #   isotropic       : random unit direction in full D-dimensional feature space
 #   random_subspace : direction in one fixed random rank-r orthonormal subspace
-#   local_pca       : per-anchor same-class KNN residual PCA, top-r right singular vectors
+#   local_pca       : per-anchor same-class KNN residual PCA
+#   cdc             : our learned LSL/CDC direction (main method)
 #
-# Recommended: use the same 3-GPU layout as the original split Phase-3 runs so
-# per-GPU batch geometry for Local PCA matches the main experiment.
+# Every regis exports train/val feature pairs from its validation-HM best model.
+# After all five regis runs of a mode finish, only the precise-HM best regis is
+# retained under:
+#   exp/scannetpp/Direction_Ablation_k1/<mode>/best_feature_pairs/
+# Non-best feature arrays are deleted to avoid excessive disk usage.
 #
 # Usage:
 #   GPU_LIST=0,3,5 bash scripts/run_scannetpp_k1_direction_ablation.sh
-#   MODES="real_only local_pca" GPU_LIST=0,3,5 bash scripts/run_scannetpp_k1_direction_ablation.sh
+#   MODES="real_only isotropic random_subspace local_pca cdc" GPU_LIST=0,3,5 \
+#     bash scripts/run_scannetpp_k1_direction_ablation.sh
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 GPU_LIST="${GPU_LIST:-0,3,5}"
-MODES="${MODES:-real_only isotropic random_subspace local_pca}"
+MODES="${MODES:-real_only isotropic random_subspace local_pca cdc}"
 REUSE_COMPLETED="${REUSE_COMPLETED:-1}"
 ALLOW_EXISTING="${ALLOW_EXISTING:-0}"
 PHASE3_RADIUS="${PHASE3_RADIUS:-auto}"
@@ -54,7 +59,7 @@ MODES="${MODES//,/ }"
 read -r -a MODE_ARRAY <<< "${MODES}"
 for mode in "${MODE_ARRAY[@]}"; do
   case "${mode}" in
-    real_only|isotropic|random_subspace|local_pca) ;;
+    real_only|isotropic|random_subspace|local_pca|cdc) ;;
     *) echo "[ERROR] Unsupported mode: ${mode}"; exit 1 ;;
   esac
 done
@@ -93,12 +98,21 @@ launch_train() {
 check_output_dir() {
   local out_dir="$1"
   local expected="$2"
-  local label="$3"
+  local marker="$3"
+  local label="$4"
 
-  if [ -f "${expected}" ] && [ "${REUSE_COMPLETED}" = "1" ]; then
-    echo "[REUSE] ${label}: ${expected}"
+  if [ -f "${expected}" ] && [ -f "${marker}" ] && [ "${REUSE_COMPLETED}" = "1" ]; then
+    echo "[REUSE] ${label}: metrics + feature-export marker found"
     return 0
   fi
+
+  # Old completed runs predate feature export. Rerun them automatically so the
+  # best-checkpoint train/val arrays are produced; no manual directory deletion.
+  if [ -f "${expected}" ] && [ ! -f "${marker}" ]; then
+    echo "[RERUN] ${label}: metrics exist but feature pairs were not exported yet"
+    return 1
+  fi
+
   if [ -d "${out_dir}" ] && [ "${ALLOW_EXISTING}" != "1" ]; then
     echo "[ERROR] Existing/incomplete output: ${out_dir}"
     echo "        Expected completion file: ${expected}"
@@ -170,6 +184,7 @@ summarize_mode() {
 import csv
 import json
 import os
+import shutil
 import statistics
 import sys
 
@@ -194,6 +209,41 @@ for key in keys:
         "max": max(vals),
     }
 
+best = max(records, key=lambda r: float(r["hm_mIoU"]))
+best_regis = best["regis"]
+best_src = os.path.join(root, best_regis, "best_feature_pairs")
+best_dst = os.path.join(root, "best_feature_pairs")
+
+# On the first completed run the best-regis directory exists and is renamed to
+# the mode-level destination (same filesystem, so this does not duplicate GBs).
+# On a later summary-only invocation best_dst can already be the retained copy.
+if os.path.isdir(best_src):
+    if os.path.isdir(best_dst):
+        shutil.rmtree(best_dst)
+    shutil.move(best_src, best_dst)
+elif not os.path.isdir(best_dst):
+    raise RuntimeError(
+        f"Best feature export missing for {mode}/{best_regis}: {best_src}"
+    )
+
+# Remove any non-best per-regis arrays. Small marker files remain so completed
+# runs are not unnecessarily retrained when the launcher is invoked again.
+for rec in records:
+    path = os.path.join(root, rec["regis"], "best_feature_pairs")
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+
+best_meta = {
+    "dataset": "scannetpp",
+    "k_shot": 1,
+    "direction_mode": mode,
+    "best_regis": best_regis,
+    "selection_metric": "precise hm_mIoU",
+    "best_metrics": {key: float(best[key]) for key in keys},
+}
+with open(os.path.join(best_dst, "best_regis.json"), "w", encoding="utf-8") as f:
+    json.dump(best_meta, f, indent=2, sort_keys=True)
+
 payload = {
     "dataset": "scannetpp",
     "k_shot": 1,
@@ -202,6 +252,8 @@ payload = {
     "protocol": "fixed split Phase2 -> Novel-head-only Phase3 direction ablation",
     "num_regis": 5,
     "std_definition": "population_std_ddof0",
+    "best_regis": best_regis,
+    "best_feature_pairs": best_dst,
     "per_regis": records,
     "aggregate": aggregate,
 }
@@ -221,6 +273,8 @@ print(f"\n===== ScanNet++ K=1 direction={mode} =====")
 for key in keys:
     a = aggregate[key]
     print(f"{key:22s}: {a['mean']:.6f} +/- {a['std']:.6f}")
+print(f"Best regis by precise HM: {best_regis} ({float(best['hm_mIoU']):.6f})")
+print(f"Best feature pairs       : {best_dst}")
 print(f"JSON: {json_path}")
 print(f"CSV : {csv_path}")
 print("============================================================")
@@ -242,7 +296,7 @@ for mode in modes:
     path = os.path.join(root, mode, "phase3_metrics_summary.json")
     with open(path, "r", encoding="utf-8") as f:
         payload = json.load(f)
-    row = {"mode": mode}
+    row = {"mode": mode, "best_regis": payload["best_regis"]}
     for key in keys:
         row[f"{key}_mean"] = payload["aggregate"][key]["mean"]
         row[f"{key}_std"] = payload["aggregate"][key]["std"]
@@ -256,7 +310,7 @@ with open(json_path, "w", encoding="utf-8") as f:
         "k_shot": 1,
         "rows": rows,
     }, f, indent=2)
-fields = ["mode"]
+fields = ["mode", "best_regis"]
 for key in keys:
     fields.extend([f"{key}_mean", f"{key}_std"])
 with open(csv_path, "w", encoding="utf-8", newline="") as f:
@@ -285,13 +339,14 @@ run_mode() {
     local p2_ckpt="${PHASE2_ROOT}/${regis}/model/model_last.pth"
     local out_dir="${target_root}/${regis}"
     local expected="${out_dir}/phase3_metrics_final.json"
+    local marker="${out_dir}/feature_export_done.txt"
 
     if [ ! -f "${p2_ckpt}" ]; then
       echo "[ERROR] Missing split Phase-2 checkpoint: ${p2_ckpt}"
       exit 1
     fi
 
-    if check_output_dir "${out_dir}" "${expected}" "${mode} ${regis}"; then
+    if check_output_dir "${out_dir}" "${expected}" "${marker}" "${mode} ${regis}"; then
       continue
     else
       status=$?
@@ -321,15 +376,21 @@ run_mode() {
       echo "[ERROR] Missing Phase-3 metrics: ${expected}"
       exit 1
     fi
+    if [ ! -d "${out_dir}/best_feature_pairs/train" ] || \
+       [ ! -d "${out_dir}/best_feature_pairs/val" ]; then
+      echo "[ERROR] Missing best-checkpoint feature export: ${out_dir}/best_feature_pairs"
+      exit 1
+    fi
     printf '%s\n' "${radius}" > "${out_dir}/base_only_radius.txt"
     printf '%s\n' "${mode}" > "${out_dir}/augmentation_mode.txt"
+    printf '%s\n' "completed" > "${marker}"
   done
 
   summarize_mode "${mode}"
 }
 
 echo "============================================================"
-echo "ScanNet++ K=1 Phase3 direction ablation"
+echo "ScanNet++ K=1 Phase3 direction ablation + feature export"
 echo "Phase2 root : ${PHASE2_ROOT}"
 echo "Modes       : ${MODES}"
 echo "GPUs/run    : ${GPU_LIST} (${NUM_GPUS})"
@@ -345,4 +406,4 @@ done
 summarize_all
 
 echo ""
-echo "[DONE] ScanNet++ K=1 direction ablation completed."
+echo "[DONE] ScanNet++ K=1 direction ablation + best feature export completed."
