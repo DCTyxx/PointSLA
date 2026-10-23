@@ -18,8 +18,16 @@ batch_size=12, 3-GPU Phase-2 runs; it can be overridden explicitly.
 import argparse
 import json
 import os
+import sys
 from collections import OrderedDict
 from functools import partial
+
+# Allow direct execution via `python tools/eval_phase2_lsl_metrics.py` from any
+# working directory by making the repository root importable before importing
+# the local `pointcept` package.
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 import torch
 
