@@ -10,7 +10,9 @@ metrics for Overall/Base/Novel anchors:
 - GDG = Intra-EVR - Inter-EVR (higher is better)
 - Mean Principal Angle in degrees (lower is better)
 
-The aggregation is anchor-weighted over all evaluated batches.
+The aggregation is anchor-weighted over all evaluated batches. The default
+single-GPU batch size is 4, matching the per-GPU batch size of the standard
+batch_size=12, 3-GPU Phase-2 runs; it can be overridden explicitly.
 """
 
 import argparse
@@ -43,7 +45,7 @@ def parse_args():
     parser.add_argument("--output", required=True, help="Output JSON path")
     parser.add_argument("--k-shot", type=int, required=True, choices=(1, 5))
     parser.add_argument("--seed", type=int, required=True)
-    parser.add_argument("--batch-size", type=int, default=12)
+    parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-workers", type=int, default=6)
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
@@ -93,7 +95,7 @@ def main():
         batch_size=args.batch_size,
         shuffle=False,
         num_workers=args.num_workers,
-        collate_fn=partial(point_collate_fn, mix_prob=cfg.mix_prob),
+        collate_fn=partial(point_collate_fn, mix_prob=float(getattr(cfg, "mix_prob", 0.0))),
         pin_memory=True,
         drop_last=False,
         persistent_workers=(args.num_workers > 0),
@@ -150,6 +152,7 @@ def main():
         "checkpoint_epoch": checkpoint.get("epoch", None),
         "k_shot": args.k_shot,
         "seed": args.seed,
+        "batch_size": args.batch_size,
         "num_batches": num_batches,
         "aggregation": "anchor_weighted_single_gpu_posthoc",
         "groups": groups,
