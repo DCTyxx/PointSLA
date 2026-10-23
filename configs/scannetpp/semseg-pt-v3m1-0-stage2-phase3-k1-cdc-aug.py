@@ -1,4 +1,4 @@
-"""Stage-2 Phase-3: CDC-guided Novel feature augmentation for ScanNet++ K=1."""
+"""Stage-2 Phase-3: Novel feature augmentation for ScanNet++ K=1."""
 
 _base_ = ["./semseg-pt-v3m1-0-stage2-phase2-k1-cdc-adapt.py"]
 
@@ -22,6 +22,13 @@ enable_amp = False
 
 model = dict(
     type="Stage2Phase3CDCAugSegmentor",
+    # Main method remains CDC by default. The dedicated direction-ablation
+    # launcher overrides only augmentation_mode while keeping all other Phase-3
+    # settings fixed.
+    augmentation_mode="cdc",
+    random_subspace_seed=0,
+    local_pca_knn=32,
+    local_pca_chunk_size=512,
     virtual_samples=4,
     virtual_radius=0.025,
     virtual_loss_weight=0.5,
