@@ -14,16 +14,22 @@ hooks = [
     dict(type="Stage2Phase3GFSEvaluator"),
     dict(type="CheckpointSaver", save_freq=None),
     dict(type="Stage2Phase3PreciseEvaluator", test_last=False),
-    # Compare precise HM across registrations and keep only one mode-level
-    # train/val feature cache. A run exports only when it becomes best-so-far.
+    # Optimized feature export:
+    # - regis1~4 do not export features;
+    # - regis5 compares all five precise-HM results;
+    # - only the final best registration is loaded;
+    # - only validation Novel anchors are exported;
+    # - one-pass uncompressed NPZ shards avoid a counting pass / giant memmap.
     dict(
         type="Stage2Phase3CachedBestFeaturePairExporter",
         output_dir="best_feature_pairs",
-        export_train=True,
+        export_train=False,
         export_val=True,
         export_seed=3407,
         num_workers=0,
         metric_key="hm_mIoU",
+        expected_regis=5,
+        final_trigger_regis="regis5",
     ),
 ]
 
