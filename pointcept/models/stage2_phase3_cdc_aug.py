@@ -187,24 +187,25 @@ class Stage2Phase3CDCAugSegmentor(Stage2Phase2CDCAdaptSegmentor):
 
     @torch.no_grad()
     def _local_pca_tangent_basis(self, novel_feature, novel_labels):
-        """Empirical local PCA basis from same-class Novel KNN residuals.
+        """Fast empirical local PCA basis from same-class Novel KNN residuals.
 
-        A class-balanced bank is built from the current trusted Novel batch using
-        the same maximum-bank convention as Tangent-CDC. For every anchor, the
-        nearest same-class points are found and their residuals define an
-        empirical local PCA subspace.
+        This implementation is mathematically equivalent to the previous Local-PCA
+        definition but removes two major sources of wasted compute:
 
-        The requested target rank is ``cdc_rank``.  However, a local empirical
-        covariance estimated from K_i neighbors cannot identify more than K_i
-        singular directions.  Therefore each anchor uses
+        1. KNN is performed class-by-class, so distances to different classes are
+           never computed and then masked out.
+        2. For residual R in R^{K x D} (K<=32, D=64), PCA is obtained from the
+           small Gram matrix G=R R^T in R^{K x K}.  We use batched ``eigh(G)`` and
+           recover right singular vectors via V = R^T U Sigma^{-1}.  This avoids
+           batched SVD of every K x D residual matrix.
 
-            r_i = min(cdc_rank, local_pca_knn, K_i)
+        For each anchor the identifiable rank remains
 
-        and the remaining columns are zero padded.  Sampling from this padded
-        basis still produces a unit direction entirely inside the identifiable
-        PCA subspace because the final feature-space direction is normalized.
-        No random directions are used to fill missing dimensions.  If K_i=0,
-        the basis and augmentation step for that isolated anchor are both zero.
+            r_i = min(cdc_rank, local_pca_knn, K_i),
+
+        with numerically null directions removed. Missing columns are zero padded;
+        no random completion directions are introduced. An anchor with no same-class
+        neighbor receives a zero basis and therefore a zero virtual step.
         """
         if novel_labels is None:
             raise ValueError("local_pca augmentation requires Novel labels")
@@ -224,49 +225,95 @@ class Stage2Phase3CDCAugSegmentor(Stage2Phase2CDCAdaptSegmentor):
             )
 
         bases = []
+        eps = torch.finfo(novel_feature.dtype).eps
         for start in range(0, n, self.local_pca_chunk_size):
             end = min(start + self.local_pca_chunk_size, n)
             anchors = novel_feature[start:end]
             labels = novel_labels[start:end]
             anchor_ids = torch.arange(start, end, device=novel_feature.device)
 
-            dist = torch.cdist(anchors, bank, p=2).square()
-            same = labels[:, None].eq(bank_labels[None, :])
-            # Remove the anchor itself if that point is present in the sampled bank.
-            same = same & anchor_ids[:, None].ne(bank_idx[None, :])
-            same_count = same.sum(dim=1)
-            effective_k = same_count.clamp(max=self.local_pca_knn).long()
-
-            # q_emp keeps a fixed [D, r] tensor shape for the downstream sampler,
-            # while each row only populates its empirically identifiable r_i
-            # columns.  Group by K_i so SVD remains batched rather than looping
-            # over every anchor separately.
             q_emp = novel_feature.new_zeros(
                 (end - start, self.feature_dim, self.cdc_rank)
             )
-            positive = effective_k > 0
-            if bool(positive.any().item()):
+
+            # Process each semantic class independently. This changes only the
+            # implementation cost: Local-PCA has always used same-class KNN.
+            for class_label in torch.unique(labels, sorted=False):
+                anchor_rows = torch.nonzero(
+                    labels.eq(class_label), as_tuple=False
+                ).flatten()
+                bank_rows = torch.nonzero(
+                    bank_labels.eq(class_label), as_tuple=False
+                ).flatten()
+                if anchor_rows.numel() == 0 or bank_rows.numel() == 0:
+                    continue
+
+                class_anchors = anchors[anchor_rows]
+                class_anchor_ids = anchor_ids[anchor_rows]
+                class_bank = bank[bank_rows]
+                class_bank_ids = bank_idx[bank_rows]
+
+                # Squared Euclidean distance via GEMM. This is substantially
+                # cheaper than full-bank cdist followed by a same-class mask.
+                anchor_sq = class_anchors.square().sum(dim=1, keepdim=True)
+                bank_sq = class_bank.square().sum(dim=1).unsqueeze(0)
+                dist = (
+                    anchor_sq
+                    + bank_sq
+                    - 2.0 * torch.matmul(class_anchors, class_bank.transpose(0, 1))
+                ).clamp_min_(0.0)
+
+                self_mask = class_anchor_ids[:, None].eq(class_bank_ids[None, :])
+                available = (~self_mask).sum(dim=1)
+                effective_k = available.clamp(max=self.local_pca_knn).long()
+                positive = effective_k > 0
+                if not bool(positive.any().item()):
+                    continue
+
+                # Only one or two K values normally occur (depending on whether
+                # the anchor itself is present in the balanced bank), so this loop
+                # stays very small while preserving each anchor's adaptive rank.
                 for k_tensor in torch.unique(effective_k[positive], sorted=True):
                     k = int(k_tensor.item())
-                    row_mask = effective_k.eq(k)
-                    row_dist = dist[row_mask]
-                    row_same = same[row_mask]
-                    row_anchor = anchors[row_mask]
+                    group_mask = effective_k.eq(k)
+                    group_rows = anchor_rows[group_mask]
+                    group_dist = dist[group_mask].masked_fill(
+                        self_mask[group_mask], float("inf")
+                    )
+                    group_anchor = class_anchors[group_mask]
 
                     nearest = torch.topk(
-                        row_dist.masked_fill(~row_same, float("inf")),
+                        group_dist,
                         k=k,
                         dim=1,
                         largest=False,
                     ).indices
-                    residual = bank[nearest] - row_anchor[:, None, :]
-                    _, _, vh = torch.linalg.svd(residual, full_matrices=False)
+                    residual = class_bank[nearest] - group_anchor[:, None, :]
 
-                    r_eff = min(self.cdc_rank, k, int(vh.shape[1]))
-                    local_basis = (
-                        vh[:, :r_eff, :].transpose(1, 2).contiguous()
-                    )
-                    q_emp[row_mask, :, :r_eff] = local_basis
+                    # Small-Gram PCA: R:[B,K,D] -> G:[B,K,K].  eigh returns
+                    # eigenvalues in ascending order, so take/flip the largest.
+                    gram = torch.bmm(residual, residual.transpose(1, 2))
+                    eigvals, left_vec = torch.linalg.eigh(gram)
+                    r_eff = min(self.cdc_rank, k)
+                    eigvals = eigvals[:, -r_eff:].flip(dims=(-1,)).clamp_min_(0.0)
+                    left_vec = left_vec[:, :, -r_eff:].flip(dims=(-1,))
+
+                    # Recover the corresponding right singular vectors:
+                    # V = R^T U / sigma. Numerically null eigen-directions are
+                    # explicitly zeroed rather than amplified by division.
+                    max_eval = eigvals[:, :1]
+                    tol = max_eval * (max(k, self.feature_dim) * eps)
+                    valid_dir = eigvals > tol
+                    sigma = eigvals.sqrt()
+                    denom = sigma.clamp_min(1e-12).unsqueeze(1)
+                    right_vec = torch.bmm(
+                        residual.transpose(1, 2), left_vec
+                    ) / denom
+                    right_vec = F.normalize(right_vec, p=2, dim=1, eps=1e-8)
+                    right_vec = right_vec * valid_dir[:, None, :].to(right_vec.dtype)
+                    right_vec = torch.nan_to_num(right_vec)
+
+                    q_emp[group_rows, :, :r_eff] = right_vec
 
             bases.append(q_emp)
 
