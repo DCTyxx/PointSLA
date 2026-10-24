@@ -9,8 +9,10 @@ source of the augmentation direction:
 - ``real_only``: no virtual feature, real Base+Novel fine-tuning only;
 - ``isotropic``: random unit direction in the full feature space;
 - ``random_subspace``: direction in one fixed random rank-r orthonormal subspace;
-- ``local_pca``: direction in the empirical rank-r PCA subspace estimated from
-  same-class Novel KNN residuals around each anchor.
+- ``local_pca``: direction in the empirical local PCA subspace estimated from
+  same-class Novel KNN residuals around each anchor.  The target rank is r, but
+  when an anchor has fewer than r same-class neighbors the identifiable local
+  rank is reduced adaptively instead of inventing random completion directions.
 
 Only the Novel classifier is trainable in Phase 3. PTv3, CDC, the Base head,
 semantic projector and radius head remain frozen.
@@ -75,8 +77,8 @@ class Stage2Phase3CDCAugSegmentor(Stage2Phase2CDCAdaptSegmentor):
             raise ValueError("virtual_loss_weight must be >= 0")
         if self.local_pca_knn < self.cdc_rank:
             raise ValueError(
-                "local_pca_knn must be >= CDC rank so the empirical PCA can "
-                f"produce r={self.cdc_rank} directions; got {self.local_pca_knn}."
+                "local_pca_knn must be >= CDC rank so well-supported anchors can "
+                f"reach r={self.cdc_rank}; got {self.local_pca_knn}."
             )
         if self.local_pca_chunk_size <= 0:
             raise ValueError("local_pca_chunk_size must be positive")
@@ -188,10 +190,21 @@ class Stage2Phase3CDCAugSegmentor(Stage2Phase2CDCAdaptSegmentor):
         """Empirical local PCA basis from same-class Novel KNN residuals.
 
         A class-balanced bank is built from the current trusted Novel batch using
-        the same maximum-bank convention as Tangent-CDC.  For every anchor, the
-        nearest same-class points are found, residuals are formed, and the first
-        ``cdc_rank`` right singular vectors define Q_emp.  Distance/SVD work is
-        chunked over anchors to cap peak memory.
+        the same maximum-bank convention as Tangent-CDC. For every anchor, the
+        nearest same-class points are found and their residuals define an
+        empirical local PCA subspace.
+
+        The requested target rank is ``cdc_rank``.  However, a local empirical
+        covariance estimated from K_i neighbors cannot identify more than K_i
+        singular directions.  Therefore each anchor uses
+
+            r_i = min(cdc_rank, local_pca_knn, K_i)
+
+        and the remaining columns are zero padded.  Sampling from this padded
+        basis still produces a unit direction entirely inside the identifiable
+        PCA subspace because the final feature-space direction is normalized.
+        No random directions are used to fill missing dimensions.  If K_i=0,
+        the basis and augmentation step for that isolated anchor are both zero.
         """
         if novel_labels is None:
             raise ValueError("local_pca augmentation requires Novel labels")
@@ -203,13 +216,13 @@ class Stage2Phase3CDCAugSegmentor(Stage2Phase2CDCAdaptSegmentor):
         )
         bank = novel_feature[bank_idx]
         bank_labels = novel_labels[bank_idx]
-        if bank.shape[0] <= self.cdc_rank:
-            raise RuntimeError(
-                "Local-PCA bank is too small for rank-r augmentation: "
-                f"bank={bank.shape[0]}, rank={self.cdc_rank}."
-            )
 
         n = novel_feature.shape[0]
+        if bank.shape[0] == 0:
+            return novel_feature.new_zeros(
+                (n, self.feature_dim, self.cdc_rank)
+            )
+
         bases = []
         for start in range(0, n, self.local_pca_chunk_size):
             end = min(start + self.local_pca_chunk_size, n)
@@ -222,33 +235,52 @@ class Stage2Phase3CDCAugSegmentor(Stage2Phase2CDCAdaptSegmentor):
             # Remove the anchor itself if that point is present in the sampled bank.
             same = same & anchor_ids[:, None].ne(bank_idx[None, :])
             same_count = same.sum(dim=1)
-            min_same = int(same_count.min().item())
-            if min_same < self.cdc_rank:
-                bad = int((same_count < self.cdc_rank).sum().item())
-                raise RuntimeError(
-                    "Local-PCA cannot form the requested rank-r empirical subspace: "
-                    f"{bad}/{end-start} anchors have fewer than r={self.cdc_rank} "
-                    "same-class neighbors in the Novel bank. Increase the batch/bank "
-                    "size or lower the PCA rank."
-                )
+            effective_k = same_count.clamp(max=self.local_pca_knn).long()
 
-            k = min(self.local_pca_knn, min_same)
-            nearest = torch.topk(
-                dist.masked_fill(~same, float("inf")),
-                k=k,
-                dim=1,
-                largest=False,
-            ).indices
-            residual = bank[nearest] - anchors[:, None, :]
-            _, _, vh = torch.linalg.svd(residual, full_matrices=False)
-            q_emp = vh[:, : self.cdc_rank, :].transpose(1, 2).contiguous()
+            # q_emp keeps a fixed [D, r] tensor shape for the downstream sampler,
+            # while each row only populates its empirically identifiable r_i
+            # columns.  Group by K_i so SVD remains batched rather than looping
+            # over every anchor separately.
+            q_emp = novel_feature.new_zeros(
+                (end - start, self.feature_dim, self.cdc_rank)
+            )
+            positive = effective_k > 0
+            if bool(positive.any().item()):
+                for k_tensor in torch.unique(effective_k[positive], sorted=True):
+                    k = int(k_tensor.item())
+                    row_mask = effective_k.eq(k)
+                    row_dist = dist[row_mask]
+                    row_same = same[row_mask]
+                    row_anchor = anchors[row_mask]
+
+                    nearest = torch.topk(
+                        row_dist.masked_fill(~row_same, float("inf")),
+                        k=k,
+                        dim=1,
+                        largest=False,
+                    ).indices
+                    residual = bank[nearest] - row_anchor[:, None, :]
+                    _, _, vh = torch.linalg.svd(residual, full_matrices=False)
+
+                    r_eff = min(self.cdc_rank, k, int(vh.shape[1]))
+                    local_basis = (
+                        vh[:, :r_eff, :].transpose(1, 2).contiguous()
+                    )
+                    q_emp[row_mask, :, :r_eff] = local_basis
+
             bases.append(q_emp)
 
         return torch.cat(bases, dim=0)
 
     @torch.no_grad()
     def _sample_subspace_directions(self, q, n):
-        """Sample M unit directions from per-anchor or shared orthonormal Q."""
+        """Sample M unit directions from per-anchor or shared orthonormal Q.
+
+        For adaptive Local-PCA, unused basis columns are exactly zero.  Random
+        coefficients on those columns vanish after projection, and the final
+        normalization therefore samples only inside the available empirical
+        subspace.  A completely zero basis yields a zero direction.
+        """
         coeff = torch.randn(
             n,
             self.virtual_samples,
