@@ -14,15 +14,16 @@ hooks = [
     dict(type="Stage2Phase3GFSEvaluator"),
     dict(type="CheckpointSaver", save_freq=None),
     dict(type="Stage2Phase3PreciseEvaluator", test_last=False),
-    # Reload model_best and export one deterministic train/val feature snapshot.
-    # The direction-ablation launcher later keeps only the best-HM regis copy.
+    # Compare precise HM across registrations and keep only one mode-level
+    # train/val feature cache. A run exports only when it becomes best-so-far.
     dict(
-        type="Stage2Phase3BestFeaturePairExporter",
+        type="Stage2Phase3CachedBestFeaturePairExporter",
         output_dir="best_feature_pairs",
         export_train=True,
         export_val=True,
         export_seed=3407,
         num_workers=0,
+        metric_key="hm_mIoU",
     ),
 ]
 
