@@ -1,33 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ScanNet++ K=1 Phase-3 augmentation-direction ablation + best feature export.
+# ScanNet++ K=1 Phase-3 direction ablation with a best-so-far feature cache.
 #
-# Fixed across all settings:
-#   - existing split_phase2_k1 checkpoint per registration;
-#   - Novel-head-only Phase-3 refinement;
-#   - same optimizer/scheduler/epochs;
-#   - M=4 virtual samples for augmentation modes;
-#   - same Base-only conservative P05 radius;
-#   - virtual loss weight = 0.5.
+# For every direction mode, five registrations are trained/evaluated normally.
+# Full train/val feature pairs are NOT exported for every registration. After
+# precise evaluation, Stage2Phase3CachedBestFeaturePairExporter compares the
+# current precise HM with the mode-level cache and exports only if the current
+# registration is better than the cached best.
+#
+# At any time there is at most one feature snapshot per mode:
+#   exp/scannetpp/Direction_Ablation_k1/<mode>/best_feature_pairs/
 #
 # Modes:
-#   real_only       : no virtual feature
-#   isotropic       : random unit direction in full D-dimensional feature space
-#   random_subspace : direction in one fixed random rank-r orthonormal subspace
-#   local_pca       : per-anchor same-class KNN residual PCA
-#   cdc             : our learned LSL/CDC direction (main method)
-#
-# Every regis exports train/val feature pairs from its validation-HM best model.
-# After all five regis runs of a mode finish, only the precise-HM best regis is
-# retained under:
-#   exp/scannetpp/Direction_Ablation_k1/<mode>/best_feature_pairs/
-# Non-best feature arrays are deleted to avoid excessive disk usage.
+#   real_only       : real-feature fine-tuning only
+#   isotropic       : random full-space directions
+#   random_subspace : fixed random rank-r orthonormal subspace
+#   local_pca       : same-class local PCA subspace
+#   cdc             : our learned LSL/CDC directions
 #
 # Usage:
 #   GPU_LIST=0,3,5 bash scripts/run_scannetpp_k1_direction_ablation.sh
-#   MODES="real_only isotropic random_subspace local_pca cdc" GPU_LIST=0,3,5 \
-#     bash scripts/run_scannetpp_k1_direction_ablation.sh
+#   MODES="cdc" GPU_LIST=0,3,5 bash scripts/run_scannetpp_k1_direction_ablation.sh
 
 PYTHON_BIN="${PYTHON_BIN:-python}"
 GPU_LIST="${GPU_LIST:-0,3,5}"
@@ -76,8 +70,7 @@ mkdir -p "${ABLATION_ROOT}"
 
 launch_train() {
   local exp_name="$1"
-  shift 1
-
+  shift
   echo ""
   echo "============================================================"
   echo "[LAUNCH] ${DATASET}/${CONFIG}"
@@ -93,33 +86,6 @@ launch_train() {
     -n "${exp_name}" \
     -g "${NUM_GPUS}" \
     "$@"
-}
-
-check_output_dir() {
-  local out_dir="$1"
-  local expected="$2"
-  local marker="$3"
-  local label="$4"
-
-  if [ -f "${expected}" ] && [ -f "${marker}" ] && [ "${REUSE_COMPLETED}" = "1" ]; then
-    echo "[REUSE] ${label}: metrics + feature-export marker found"
-    return 0
-  fi
-
-  # Old completed runs predate feature export. Rerun them automatically so the
-  # best-checkpoint train/val arrays are produced; no manual directory deletion.
-  if [ -f "${expected}" ] && [ ! -f "${marker}" ]; then
-    echo "[RERUN] ${label}: metrics exist but feature pairs were not exported yet"
-    return 1
-  fi
-
-  if [ -d "${out_dir}" ] && [ "${ALLOW_EXISTING}" != "1" ]; then
-    echo "[ERROR] Existing/incomplete output: ${out_dir}"
-    echo "        Expected completion file: ${expected}"
-    echo "        Remove it or set ALLOW_EXISTING=1 intentionally."
-    return 2
-  fi
-  return 1
 }
 
 resolve_radius() {
@@ -170,10 +136,82 @@ if os.path.isfile(stage1_log):
             raise SystemExit(0)
 
 raise SystemExit(
-    "Cannot recover the split Phase-3/Base-P05 radius. "
-    "Set PHASE3_RADIUS explicitly."
+    "Cannot recover split Phase-3/Base-P05 radius. Set PHASE3_RADIUS explicitly."
 )
 PY
+}
+
+run_mode() {
+  local mode="$1"
+  local mode_root="${ABLATION_ROOT}/${mode}"
+  mkdir -p "${mode_root}"
+
+  echo ""
+  echo "####################################################################"
+  echo "# ScanNet++ K=1 direction ablation: ${mode}"
+  echo "# Shared feature cache: ${mode_root}/best_feature_pairs"
+  echo "####################################################################"
+
+  local i
+  for i in "${!REGIS[@]}"; do
+    local regis="${REGIS[$i]}"
+    local seed="${SEEDS[$i]}"
+    local p2_ckpt="${PHASE2_ROOT}/${regis}/model/model_last.pth"
+    local out_dir="${mode_root}/${regis}"
+    local metrics="${out_dir}/phase3_metrics_final.json"
+    local cache_status="${out_dir}/feature_export_cache_status.json"
+
+    if [ ! -f "${p2_ckpt}" ]; then
+      echo "[ERROR] Missing split Phase-2 checkpoint: ${p2_ckpt}"
+      exit 1
+    fi
+
+    if [ -f "${metrics}" ] && [ -f "${cache_status}" ] && [ "${REUSE_COMPLETED}" = "1" ]; then
+      echo "[REUSE] ${mode}/${regis}: metrics + cache status found"
+      continue
+    fi
+
+    # Old runs may have precise metrics but no cache status because they were
+    # produced before the cache implementation. We intentionally rerun those.
+    if [ -d "${out_dir}" ] && [ ! -f "${metrics}" ] && [ "${ALLOW_EXISTING}" != "1" ]; then
+      echo "[ERROR] Existing incomplete output: ${out_dir}"
+      echo "        Remove it or set ALLOW_EXISTING=1 intentionally."
+      exit 1
+    fi
+
+    local radius
+    radius="$(resolve_radius "${regis}")"
+    echo "[SETTING] mode=${mode} ${regis} seed=${seed} radius=${radius} M=4"
+
+    local exp_name="Direction_Ablation_k1/${mode}/${regis}"
+    launch_train \
+      "${exp_name}" \
+      -o "phase2_weight='${p2_ckpt}'" \
+      -o "phase3_regis_name='${regis}'" \
+      -o "data.train.k_shot=1" \
+      -o "data.train.seed=${seed}" \
+      -o "model.augmentation_mode='${mode}'" \
+      -o "model.random_subspace_seed=${seed}" \
+      -o "model.local_pca_knn=${PCA_KNN}" \
+      -o "model.local_pca_chunk_size=${PCA_CHUNK_SIZE}" \
+      -o "model.virtual_samples=4" \
+      -o "model.virtual_radius=${radius}" \
+      -o "model.virtual_loss_weight=0.5"
+
+    if [ ! -f "${metrics}" ]; then
+      echo "[ERROR] Missing Phase-3 metrics: ${metrics}"
+      exit 1
+    fi
+    if [ ! -f "${cache_status}" ]; then
+      echo "[ERROR] Missing feature-cache status: ${cache_status}"
+      exit 1
+    fi
+
+    printf '%s\n' "${radius}" > "${out_dir}/base_only_radius.txt"
+    printf '%s\n' "${mode}" > "${out_dir}/augmentation_mode.txt"
+  done
+
+  summarize_mode "${mode}"
 }
 
 summarize_mode() {
@@ -183,8 +221,8 @@ summarize_mode() {
   "${PYTHON_BIN}" - "${root}" "${mode}" <<'PY'
 import csv
 import json
+import math
 import os
-import shutil
 import statistics
 import sys
 
@@ -211,38 +249,33 @@ for key in keys:
 
 best = max(records, key=lambda r: float(r["hm_mIoU"]))
 best_regis = best["regis"]
-best_src = os.path.join(root, best_regis, "best_feature_pairs")
-best_dst = os.path.join(root, "best_feature_pairs")
+best_hm = float(best["hm_mIoU"])
+cache_root = os.path.join(root, "best_feature_pairs")
+state_path = os.path.join(cache_root, "cache_state.json")
+if not os.path.isfile(state_path):
+    raise RuntimeError(f"Feature cache state missing: {state_path}")
+with open(state_path, "r", encoding="utf-8") as f:
+    state = json.load(f)
 
-# On the first completed run the best-regis directory exists and is renamed to
-# the mode-level destination (same filesystem, so this does not duplicate GBs).
-# On a later summary-only invocation best_dst can already be the retained copy.
-if os.path.isdir(best_src):
-    if os.path.isdir(best_dst):
-        shutil.rmtree(best_dst)
-    shutil.move(best_src, best_dst)
-elif not os.path.isdir(best_dst):
+if state.get("best_regis") != best_regis:
     raise RuntimeError(
-        f"Best feature export missing for {mode}/{best_regis}: {best_src}"
+        f"Feature cache mismatch for {mode}: cache={state.get('best_regis')} "
+        f"but precise-HM best={best_regis}"
     )
-
-# Remove any non-best per-regis arrays. Small marker files remain so completed
-# runs are not unnecessarily retrained when the launcher is invoked again.
-for rec in records:
-    path = os.path.join(root, rec["regis"], "best_feature_pairs")
-    if os.path.isdir(path):
-        shutil.rmtree(path)
-
-best_meta = {
-    "dataset": "scannetpp",
-    "k_shot": 1,
-    "direction_mode": mode,
-    "best_regis": best_regis,
-    "selection_metric": "precise hm_mIoU",
-    "best_metrics": {key: float(best[key]) for key in keys},
-}
-with open(os.path.join(best_dst, "best_regis.json"), "w", encoding="utf-8") as f:
-    json.dump(best_meta, f, indent=2, sort_keys=True)
+if not math.isclose(float(state["best_metric"]), best_hm, rel_tol=0.0, abs_tol=1e-10):
+    raise RuntimeError(
+        f"Feature cache metric mismatch for {mode}: cache={state['best_metric']} "
+        f"but precise-HM best={best_hm}"
+    )
+for split in ("train", "val"):
+    split_root = os.path.join(cache_root, split)
+    required = [
+        "features.npy", "labels.npy", "scene_ids.npy", "point_ids.npy",
+        "virtual_features.npy", "directions.npy", "virtual_anchor_indices.npy",
+    ]
+    missing = [x for x in required if not os.path.isfile(os.path.join(split_root, x))]
+    if missing:
+        raise RuntimeError(f"Incomplete feature cache {mode}/{split}: missing={missing}")
 
 payload = {
     "dataset": "scannetpp",
@@ -253,7 +286,7 @@ payload = {
     "num_regis": 5,
     "std_definition": "population_std_ddof0",
     "best_regis": best_regis,
-    "best_feature_pairs": best_dst,
+    "best_feature_pairs": cache_root,
     "per_regis": records,
     "aggregate": aggregate,
 }
@@ -273,10 +306,8 @@ print(f"\n===== ScanNet++ K=1 direction={mode} =====")
 for key in keys:
     a = aggregate[key]
     print(f"{key:22s}: {a['mean']:.6f} +/- {a['std']:.6f}")
-print(f"Best regis by precise HM: {best_regis} ({float(best['hm_mIoU']):.6f})")
-print(f"Best feature pairs       : {best_dst}")
-print(f"JSON: {json_path}")
-print(f"CSV : {csv_path}")
+print(f"Best regis by precise HM: {best_regis} ({best_hm:.6f})")
+print(f"Feature cache           : {cache_root}")
 print("============================================================")
 PY
 }
@@ -305,11 +336,7 @@ for mode in modes:
 json_path = os.path.join(root, "direction_ablation_summary.json")
 csv_path = os.path.join(root, "direction_ablation_summary.csv")
 with open(json_path, "w", encoding="utf-8") as f:
-    json.dump({
-        "dataset": "scannetpp",
-        "k_shot": 1,
-        "rows": rows,
-    }, f, indent=2)
+    json.dump({"dataset": "scannetpp", "k_shot": 1, "rows": rows}, f, indent=2)
 fields = ["mode", "best_regis"]
 for key in keys:
     fields.extend([f"{key}_mean", f"{key}_std"])
@@ -321,76 +348,8 @@ print(f"[SUMMARY] {csv_path}")
 PY
 }
 
-run_mode() {
-  local mode="$1"
-  local target_root="${ABLATION_ROOT}/${mode}"
-
-  echo ""
-  echo "####################################################################"
-  echo "# ScanNet++ K=1 direction ablation: ${mode}"
-  echo "# Phase-2 source: ${PHASE2_ROOT}"
-  echo "# Output        : ${target_root}"
-  echo "####################################################################"
-
-  local i
-  for i in "${!REGIS[@]}"; do
-    local regis="${REGIS[$i]}"
-    local seed="${SEEDS[$i]}"
-    local p2_ckpt="${PHASE2_ROOT}/${regis}/model/model_last.pth"
-    local out_dir="${target_root}/${regis}"
-    local expected="${out_dir}/phase3_metrics_final.json"
-    local marker="${out_dir}/feature_export_done.txt"
-
-    if [ ! -f "${p2_ckpt}" ]; then
-      echo "[ERROR] Missing split Phase-2 checkpoint: ${p2_ckpt}"
-      exit 1
-    fi
-
-    if check_output_dir "${out_dir}" "${expected}" "${marker}" "${mode} ${regis}"; then
-      continue
-    else
-      status=$?
-      if [ "${status}" -eq 2 ]; then exit 1; fi
-    fi
-
-    local radius
-    radius="$(resolve_radius "${regis}")"
-    echo "[SETTING] mode=${mode} ${regis} seed=${seed} radius=${radius} M=4"
-
-    local exp_name="Direction_Ablation_k1/${mode}/${regis}"
-    launch_train \
-      "${exp_name}" \
-      -o "phase2_weight='${p2_ckpt}'" \
-      -o "phase3_regis_name='${regis}'" \
-      -o "data.train.k_shot=1" \
-      -o "data.train.seed=${seed}" \
-      -o "model.augmentation_mode='${mode}'" \
-      -o "model.random_subspace_seed=${seed}" \
-      -o "model.local_pca_knn=${PCA_KNN}" \
-      -o "model.local_pca_chunk_size=${PCA_CHUNK_SIZE}" \
-      -o "model.virtual_samples=4" \
-      -o "model.virtual_radius=${radius}" \
-      -o "model.virtual_loss_weight=0.5"
-
-    if [ ! -f "${expected}" ]; then
-      echo "[ERROR] Missing Phase-3 metrics: ${expected}"
-      exit 1
-    fi
-    if [ ! -d "${out_dir}/best_feature_pairs/train" ] || \
-       [ ! -d "${out_dir}/best_feature_pairs/val" ]; then
-      echo "[ERROR] Missing best-checkpoint feature export: ${out_dir}/best_feature_pairs"
-      exit 1
-    fi
-    printf '%s\n' "${radius}" > "${out_dir}/base_only_radius.txt"
-    printf '%s\n' "${mode}" > "${out_dir}/augmentation_mode.txt"
-    printf '%s\n' "completed" > "${marker}"
-  done
-
-  summarize_mode "${mode}"
-}
-
 echo "============================================================"
-echo "ScanNet++ K=1 Phase3 direction ablation + feature export"
+echo "ScanNet++ K=1 direction ablation + best-so-far feature cache"
 echo "Phase2 root : ${PHASE2_ROOT}"
 echo "Modes       : ${MODES}"
 echo "GPUs/run    : ${GPU_LIST} (${NUM_GPUS})"
@@ -406,4 +365,4 @@ done
 summarize_all
 
 echo ""
-echo "[DONE] ScanNet++ K=1 direction ablation + best feature export completed."
+echo "[DONE] ScanNet++ K=1 direction ablation + cached best feature export completed."
