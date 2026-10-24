@@ -142,7 +142,7 @@ run_eval() {
   echo "============================================================"
 
   CUDA_VISIBLE_DEVICES="${GPU}" \
-  "${PYTHON_BIN}" -u tools/test.py \
+  "${PYTHON_BIN}" -u visilization/test_gfs_vis.py \
     --config-file "configs/${dataset}/${config}.py" \
     --num-gpus 1 \
     --options \
@@ -153,6 +153,10 @@ run_eval() {
 
   if ! has_scene_outputs "${vis_dir}"; then
     echo "[ERROR] Evaluation produced no scene visualization outputs: ${vis_dir}"
+    exit 1
+  fi
+  if [ ! -f "${out_dir}/evaluation_metrics.json" ]; then
+    echo "[ERROR] Evaluation metrics were not saved: ${out_dir}/evaluation_metrics.json"
     exit 1
   fi
   printf '%s\n' "${ckpt}" > "${marker}"
@@ -174,6 +178,8 @@ for dataset in "${DATASET_ARRAY[@]}"; do
   echo "# ${dataset} K=${K} visualization"
   echo "# matched regis : ${regis}"
   echo "# Our precise HM: ${best_hm}"
+  echo "# Baseline CKPT : ${baseline_ckpt}"
+  echo "# Our CKPT      : ${our_ckpt}"
   echo "####################################################################"
 
   eval_root="${VIS_ROOT}/evaluation/${dataset}"
