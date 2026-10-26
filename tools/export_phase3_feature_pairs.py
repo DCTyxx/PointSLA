@@ -62,13 +62,16 @@ def parse_args():
     parser.add_argument(
         "--augmentation-mode",
         default=None,
-        choices=[None, "cdc", "real_only", "isotropic", "random_subspace", "local_pca"],
+        choices=["cdc", "real_only", "isotropic", "random_subspace", "local_pca"],
     )
     parser.add_argument(
         "--virtual-radius",
         type=float,
         default=None,
-        help="Optional override. If omitted, use the value stored in the config/model.",
+        help=(
+            "Optional override. If omitted, automatically read base_only_radius.txt "
+            "beside the checkpoint run when available; otherwise use config value."
+        ),
     )
     parser.add_argument("--force", action="store_true")
     return parser.parse_args()
@@ -92,6 +95,31 @@ def write_json(path, payload):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(payload, f, indent=2, sort_keys=True)
+
+
+def resolve_virtual_radius(args, checkpoint_path, model, logger):
+    if args.virtual_radius is not None:
+        radius = float(args.virtual_radius)
+        source = "command_line"
+    else:
+        # checkpoint = <regis>/model/model_best.pth
+        regis_root = os.path.dirname(os.path.dirname(checkpoint_path))
+        radius_file = os.path.join(regis_root, "base_only_radius.txt")
+        if os.path.isfile(radius_file):
+            text = open(radius_file, "r", encoding="utf-8").read().strip()
+            if not text:
+                raise RuntimeError(f"Empty radius file: {radius_file}")
+            radius = float(text)
+            source = radius_file
+        else:
+            radius = float(model.virtual_radius)
+            source = "config_default"
+
+    if radius <= 0:
+        raise ValueError(f"virtual_radius must be positive, got {radius}")
+    model.virtual_radius = radius
+    logger.info("Virtual radius: %.8f (%s)", radius, source)
+    return radius, source
 
 
 def main():
@@ -135,8 +163,10 @@ def main():
 
     if args.augmentation_mode is not None:
         model.augmentation_mode = args.augmentation_mode
-    if args.virtual_radius is not None:
-        model.virtual_radius = float(args.virtual_radius)
+
+    virtual_radius, radius_source = resolve_virtual_radius(
+        args, checkpoint_path, model, logger
+    )
 
     # Reproduce the registration-specific random-subspace seed convention used
     # by the direction-ablation launcher: regis1..5 -> 10,20,...,50.
@@ -187,6 +217,8 @@ def main():
             "selected_checkpoint": checkpoint_path,
             "checkpoint_epoch": epoch,
             "config": config_path,
+            "virtual_radius": virtual_radius,
+            "virtual_radius_source": radius_source,
             "val": val_meta,
         }
         write_json(os.path.join(temp_dir, "cache_state.json"), state)
@@ -197,6 +229,8 @@ def main():
                 "selection_metric": "explicit_checkpoint",
                 "augmentation_mode": str(model.augmentation_mode),
                 "checkpoint": checkpoint_path,
+                "virtual_radius": virtual_radius,
+                "virtual_radius_source": radius_source,
             },
         )
 
