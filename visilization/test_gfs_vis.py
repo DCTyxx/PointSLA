@@ -9,7 +9,16 @@ or `color` after fragment construction/inverse mapping.
 
 import json
 import os
+import sys
 import time
+
+# Allow this file to be executed directly as
+#   python visilization/test_gfs_vis.py ...
+# from any working directory without requiring an editable installation of
+# pointcept.  The repository root is the parent of the visilization directory.
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 import numpy as np
 import torch
