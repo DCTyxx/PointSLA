@@ -13,6 +13,11 @@ set -euo pipefail
 #   CKPT=/path/to/model_best.pth
 #   OUT_DIR=/path/to/output
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "${REPO_ROOT}"
+export PYTHONPATH="${REPO_ROOT}:${PYTHONPATH:-}"
+
 PYTHON_BIN="${PYTHON_BIN:-python}"
 GPU="${GPU:-4}"
 
@@ -35,9 +40,11 @@ mkdir -p "${OUT_DIR}"
 # Preserve exact provenance of this evaluation.
 printf '%s\n' "${CKPT}" > "${OUT_DIR}/source_checkpoint.txt"
 printf '%s\n' "${CONFIG}" > "${OUT_DIR}/source_config.txt"
+printf '%s\n' "${REPO_ROOT}" > "${OUT_DIR}/repo_root.txt"
 
 cat > "${OUT_DIR}/evaluation_command.txt" <<EOF
-CUDA_VISIBLE_DEVICES=${GPU} ${PYTHON_BIN} -u visilization/test_gfs_vis.py \\
+cd ${REPO_ROOT}
+PYTHONPATH=${REPO_ROOT}:\${PYTHONPATH:-} CUDA_VISIBLE_DEVICES=${GPU} ${PYTHON_BIN} -u visilization/test_gfs_vis.py \\
   --config-file ${CONFIG} \\
   --num-gpus 1 \\
   --options save_path=${OUT_DIR} weight=${CKPT} phase3_regis_name=regis3 empty_cache=True
@@ -45,13 +52,15 @@ EOF
 
 echo "============================================================"
 echo "ScanNet++ K=1 / regis3 checkpoint evaluation"
+echo "Repo root  : ${REPO_ROOT}"
 echo "Checkpoint : ${CKPT}"
 echo "Config     : ${CONFIG}"
 echo "Output     : ${OUT_DIR}"
 echo "GPU        : ${GPU}"
+echo "PYTHONPATH : ${PYTHONPATH}"
 echo "============================================================"
 
-# SafeGFSSemSegTester writes evaluation_metrics.json into OUT_DIR.  No per-scene
+# SafeGFSSemSegTester writes evaluation_metrics.json into OUT_DIR. No per-scene
 # visualization arrays are requested here, so this run only performs validation
 # and stores metrics/logs.
 CUDA_VISIBLE_DEVICES="${GPU}" \
