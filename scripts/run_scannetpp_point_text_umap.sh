@@ -1,16 +1,19 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Compare ScanNet++ PTv3 64-D point features against the learned SSC semantic
-# space and frozen text prototypes.
+# Compare ScanNet++ raw Point Encoder (PTv3 backbone) features against frozen
+# CLIP text prototypes. The semantic projector is intentionally excluded from
+# the primary visualization.
 #
 # Default:
 #   GPU=4 bash scripts/run_scannetpp_point_text_umap.sh
 #
 # Useful overrides:
 #   METHOD=both GPU=4 bash scripts/run_scannetpp_point_text_umap.sh
-#   MAX_POINTS_PER_CLASS=200 GPU=4 bash scripts/run_scannetpp_point_text_umap.sh
-#   CHECKPOINT=/path/to/model_best.pth GPU=4 bash scripts/run_scannetpp_point_text_umap.sh
+#   MAX_POINTS_PER_CLASS=2048 MIN_POINTS_PER_CLASS=2048 GPU=4 \
+#     bash scripts/run_scannetpp_point_text_umap.sh
+#   CHECKPOINT=/path/to/model_best.pth GPU=4 \
+#     bash scripts/run_scannetpp_point_text_umap.sh
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -21,9 +24,9 @@ export PYTHONPATH="${REPO_ROOT}${PYTHONPATH:+:${PYTHONPATH}}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
 GPU="${GPU:-4}"
 METHOD="${METHOD:-auto}"
-MAX_POINTS_PER_CLASS="${MAX_POINTS_PER_CLASS:-128}"
-MIN_POINTS_PER_CLASS="${MIN_POINTS_PER_CLASS:-32}"
-MAX_PER_SCENE_PER_CLASS="${MAX_PER_SCENE_PER_CLASS:-32}"
+MAX_POINTS_PER_CLASS="${MAX_POINTS_PER_CLASS:-1024}"
+MIN_POINTS_PER_CLASS="${MIN_POINTS_PER_CLASS:-1024}"
+MAX_PER_SCENE_PER_CLASS="${MAX_PER_SCENE_PER_CLASS:-256}"
 SEED="${SEED:-3407}"
 
 CONFIG="${CONFIG:-configs/scannetpp/semseg-pt-v3m1-0-conservative-boundary-semantic-tangent-cdcbase-frozen-r24.py}"
@@ -43,13 +46,15 @@ mkdir -p "${OUT_DIR}"
 
 cat <<EOF
 ============================================================
-PointSLA Point/Text Feature-Space Visualization
-Config      : ${CONFIG}
-Checkpoint  : ${CHECKPOINT}
-Output      : ${OUT_DIR}
-GPU         : ${GPU}
-Method      : ${METHOD}
-Points/class: ${MAX_POINTS_PER_CLASS}
+PointSLA Point Encoder / CLIP Text Encoder Visualization
+Config        : ${CONFIG}
+Checkpoint    : ${CHECKPOINT}
+Output        : ${OUT_DIR}
+GPU           : ${GPU}
+Method        : ${METHOD}
+Points/class  : ${MAX_POINTS_PER_CLASS}
+Min/class     : ${MIN_POINTS_PER_CLASS}
+Max/scene/cls : ${MAX_PER_SCENE_PER_CLASS}
 ============================================================
 EOF
 
@@ -68,4 +73,5 @@ CUDA_VISIBLE_DEVICES="${GPU}" \
 echo "============================================================"
 echo "Done: ${OUT_DIR}"
 echo "Metrics: ${OUT_DIR}/metrics.json"
+echo "Primary plot: ${OUT_DIR}/${METHOD}_point_vs_text.*"
 echo "============================================================"
