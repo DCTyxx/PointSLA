@@ -29,6 +29,7 @@ import pointcept.datasets.transform as pointcept_transform
 
 
 _ORIGINAL_TENSOR_NUMPY = torch.Tensor.numpy
+_ORIGINAL_TENSOR_GETITEM = torch.Tensor.__getitem__
 
 
 def _dtype_for_buffer(dtype: np.dtype):
@@ -116,6 +117,27 @@ def _compat_tensor_numpy(self, *args, **kwargs):
         return np.asarray(tensor.tolist())
 
 
+def _compat_index(index, device):
+    """Convert NumPy indices before PyTorch tries to infer their dtype."""
+    if isinstance(index, np.ndarray):
+        converted = _ndarray_to_tensor(index)
+        if np.issubdtype(index.dtype, np.bool_):
+            converted = converted.bool()
+        elif np.issubdtype(index.dtype, np.integer):
+            converted = converted.long()
+        return converted.to(device=device)
+    if isinstance(index, np.integer):
+        return int(index)
+    if isinstance(index, tuple):
+        return tuple(_compat_index(item, device) for item in index)
+    return index
+
+
+def _compat_tensor_getitem(self, index):
+    """Allow Tensor[numpy_int_array] without using PyTorch's NumPy bridge."""
+    return _ORIGINAL_TENSOR_GETITEM(self, _compat_index(index, self.device))
+
+
 def _probe_numpy_bridge():
     try:
         probe = np.zeros((2,), dtype=np.float32)
@@ -144,9 +166,10 @@ def main():
     # through their class, so already-built Compose pipelines use this method.
     pointcept_transform.ToTensor.__call__ = _compat_to_tensor
     torch.Tensor.numpy = _compat_tensor_numpy
+    torch.Tensor.__getitem__ = _compat_tensor_getitem
     print(
         "[INFO] Enabled visualization-only DLPack/buffer compatibility for "
-        "NumPy <-> Torch conversion."
+        "NumPy <-> Torch conversion and NumPy-based Tensor indexing."
     )
 
     target = REPO_ROOT / "tools" / "visualize_point_text_feature_space.py"
