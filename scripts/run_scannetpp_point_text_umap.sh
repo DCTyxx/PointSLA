@@ -54,7 +54,7 @@ Points/class: ${MAX_POINTS_PER_CLASS}
 EOF
 
 CUDA_VISIBLE_DEVICES="${GPU}" \
-"${PYTHON_BIN}" -u tools/visualize_point_text_feature_space.py \
+"${PYTHON_BIN}" -u tools/run_feature_space_compat.py \
   --config "${CONFIG}" \
   --checkpoint "${CHECKPOINT}" \
   --output-dir "${OUT_DIR}" \
