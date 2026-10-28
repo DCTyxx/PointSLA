@@ -3,9 +3,8 @@
 
 Some server environments expose NumPy arrays for which ``torch.from_numpy``
 raises ``TypeError: expected np.ndarray (got numpy.ndarray)`` because the
-installed PyTorch/NumPy bridge is ABI-incompatible.  The Pointcept dataset
-pipeline calls ``torch.from_numpy`` inside ``ToTensor`` before the visualization
-script can extract any features.
+installed PyTorch/NumPy bridge is ABI-incompatible or because arrays originate
+from a different NumPy loading path.
 
 This launcher patches only Pointcept's ``ToTensor`` class in this process.  It
 prefers NumPy's DLPack interface, falls back to the Python buffer protocol, and
@@ -15,7 +14,6 @@ not modified.
 
 from __future__ import annotations
 
-import os
 import runpy
 import sys
 from collections.abc import Mapping, Sequence
@@ -51,17 +49,16 @@ def _ndarray_to_tensor(array: np.ndarray) -> torch.Tensor:
     """Convert NumPy -> Torch without relying on torch.from_numpy."""
     array = np.ascontiguousarray(array)
 
-    # Preferred path: NumPy >= 1.22 implements the DLPack protocol.  This avoids
-    # PyTorch's NumPy C-API bridge entirely and keeps the conversion efficient.
+    # Preferred path: NumPy >= 1.22 implements DLPack. This bypasses PyTorch's
+    # NumPy C-API bridge and is efficient for normal numeric arrays.
     if hasattr(array, "__dlpack__"):
         try:
-            tensor = torch.utils.dlpack.from_dlpack(array)
-            return tensor
+            return torch.utils.dlpack.from_dlpack(array)
         except Exception:
             pass
 
-    # Second path: use Python's buffer protocol. Clone so the returned tensor
-    # owns stable storage independent of the temporary NumPy array.
+    # Second path: Python buffer protocol. Clone so the tensor owns stable
+    # storage independent of the temporary contiguous NumPy array.
     torch_dtype = _dtype_for_buffer(array.dtype)
     if torch_dtype is not None:
         try:
@@ -70,9 +67,7 @@ def _ndarray_to_tensor(array: np.ndarray) -> torch.Tensor:
         except Exception:
             pass
 
-    # Last-resort path. It is slower, but this visualization samples only a
-    # limited number of validation points and correctness is preferable to an
-    # environment-specific crash.
+    # Last resort. Slower, but robust and only used in this diagnostic script.
     if np.issubdtype(array.dtype, np.bool_):
         return torch.tensor(array.tolist(), dtype=torch.bool)
     if np.issubdtype(array.dtype, np.integer):
@@ -108,30 +103,37 @@ def _compat_to_tensor(self, data):
     raise TypeError(f"type {type(data)} cannot be converted to tensor")
 
 
-def _probe_numpy_bridge() -> bool:
-    """Return True when native torch.from_numpy works in this environment."""
+def _probe_numpy_bridge():
     try:
         probe = np.zeros((2,), dtype=np.float32)
         torch.from_numpy(probe)
-        return True
+        return True, None
     except Exception as exc:
-        print(
-            "[WARN] Native torch.from_numpy is unavailable in this environment: "
-            f"{type(exc).__name__}: {exc}"
-        )
-        return False
+        return False, exc
 
 
 def main():
-    native_ok = _probe_numpy_bridge()
+    native_ok, native_exc = _probe_numpy_bridge()
     if native_ok:
-        print("[INFO] Native torch.from_numpy probe succeeded.")
+        print(
+            "[INFO] Native torch.from_numpy probe succeeded; "
+            "using the visualization-local compatibility converter anyway "
+            "to avoid dataset-specific NumPy bridge failures."
+        )
     else:
         print(
-            "[INFO] Enabling visualization-only DLPack/buffer fallback for "
-            "Pointcept ToTensor."
+            "[WARN] Native torch.from_numpy probe failed: "
+            f"{type(native_exc).__name__}: {native_exc}"
         )
-        pointcept_transform.ToTensor.__call__ = _compat_to_tensor
+
+    # Always patch in this process only. Existing ToTensor objects dispatch
+    # __call__ through their class, so already-built Compose pipelines use this
+    # replacement as well.
+    pointcept_transform.ToTensor.__call__ = _compat_to_tensor
+    print(
+        "[INFO] Enabled visualization-only DLPack/buffer fallback for "
+        "Pointcept ToTensor."
+    )
 
     target = REPO_ROOT / "tools" / "visualize_point_text_feature_space.py"
     if not target.is_file():
