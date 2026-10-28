@@ -8,13 +8,18 @@ from a different NumPy loading path.
 
 This launcher patches conversions only inside this visualization process. It
 uses DLPack first, then the Python buffer protocol / Python lists as fallbacks.
-Training code and repository-wide transforms are not modified.
+It also bypasses NumPy's ``savez`` array-function dispatcher, which can fail in
+mixed/ABI-incompatible NumPy environments even after feature extraction has
+completed successfully. Training code and repository-wide transforms are not
+modified.
 """
 
 from __future__ import annotations
 
+import io
 import runpy
 import sys
+import zipfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -102,19 +107,42 @@ def _compat_to_tensor(self, data):
 
 
 def _compat_tensor_numpy(self, *args, **kwargs):
-    """Torch -> NumPy fallback for the same ABI-incompatible environments."""
-    try:
-        return _ORIGINAL_TENSOR_NUMPY(self, *args, **kwargs)
-    except Exception:
-        tensor = self.detach().cpu().resolve_conj().resolve_neg()
-        if hasattr(np, "from_dlpack"):
-            try:
-                # NumPy's DLPack view can be read-only; copy gives normal ndarray
-                # semantics expected by scikit-learn/UMAP and np.savez.
-                return np.from_dlpack(tensor).copy()
-            except Exception:
-                pass
-        return np.asarray(tensor.tolist())
+    """Convert Torch -> NumPy without calling PyTorch's NumPy C-API bridge."""
+    if args or kwargs:
+        raise TypeError(
+            "Visualization compatibility Tensor.numpy() does not accept arguments"
+        )
+
+    tensor = self.detach().cpu().resolve_conj().resolve_neg().contiguous()
+    if hasattr(np, "from_dlpack"):
+        try:
+            # NumPy's DLPack view can be read-only. Copy gives ordinary ndarray
+            # semantics expected by scikit-learn, UMAP, plotting, and saving.
+            return np.from_dlpack(tensor).copy()
+        except Exception:
+            pass
+
+    # Slow last resort, used only when DLPack is unavailable for this dtype.
+    values = tensor.tolist()
+    if tensor.dtype == torch.bool:
+        return np.array(values, dtype=np.bool_)
+    if tensor.dtype in (torch.uint8, torch.int8, torch.int16, torch.int32, torch.int64):
+        dtype_map = {
+            torch.uint8: np.uint8,
+            torch.int8: np.int8,
+            torch.int16: np.int16,
+            torch.int32: np.int32,
+            torch.int64: np.int64,
+        }
+        return np.array(values, dtype=dtype_map[tensor.dtype])
+    if tensor.dtype in (torch.float16, torch.float32, torch.float64):
+        dtype_map = {
+            torch.float16: np.float16,
+            torch.float32: np.float32,
+            torch.float64: np.float64,
+        }
+        return np.array(values, dtype=dtype_map[tensor.dtype])
+    return np.array(values)
 
 
 def _compat_index(index, device):
@@ -136,6 +164,37 @@ def _compat_index(index, device):
 def _compat_tensor_getitem(self, index):
     """Allow Tensor[numpy_int_array] without using PyTorch's NumPy bridge."""
     return _ORIGINAL_TENSOR_GETITEM(self, _compat_index(index, self.device))
+
+
+def _compat_savez(file, *args, **kwargs):
+    """Write a normal NPZ archive without NumPy's __array_function__ dispatcher."""
+    arrays = {}
+    for idx, value in enumerate(args):
+        arrays[f"arr_{idx}"] = value
+    for key, value in kwargs.items():
+        if key in arrays:
+            raise ValueError(f"Duplicate NPZ key: {key}")
+        arrays[str(key)] = value
+
+    path = file
+    if isinstance(path, (str, Path)):
+        path = str(path)
+        if not path.endswith(".npz"):
+            path += ".npz"
+
+    with zipfile.ZipFile(
+        path,
+        mode="w",
+        compression=zipfile.ZIP_STORED,
+        allowZip64=True,
+    ) as archive:
+        for key, value in arrays.items():
+            # The analysis script passes ndarrays here. Avoid np.asarray on an
+            # ndarray because that may invoke the same broken dispatch stack.
+            array = value if isinstance(value, np.ndarray) else np.array(value)
+            buffer = io.BytesIO()
+            np.lib.format.write_array(buffer, array, allow_pickle=True)
+            archive.writestr(f"{key}.npy", buffer.getvalue())
 
 
 def _probe_numpy_bridge():
@@ -162,14 +221,15 @@ def main():
             f"{type(native_exc).__name__}: {native_exc}"
         )
 
-    # Patches are process-local. Existing ToTensor objects dispatch __call__
+    # All patches are process-local. Existing ToTensor objects dispatch __call__
     # through their class, so already-built Compose pipelines use this method.
     pointcept_transform.ToTensor.__call__ = _compat_to_tensor
     torch.Tensor.numpy = _compat_tensor_numpy
     torch.Tensor.__getitem__ = _compat_tensor_getitem
+    np.savez = _compat_savez
     print(
-        "[INFO] Enabled visualization-only DLPack/buffer compatibility for "
-        "NumPy <-> Torch conversion and NumPy-based Tensor indexing."
+        "[INFO] Enabled visualization-only compatibility for NumPy <-> Torch, "
+        "NumPy-based Tensor indexing, and NPZ saving."
     )
 
     target = REPO_ROOT / "tools" / "visualize_point_text_feature_space.py"
