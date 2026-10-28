@@ -1,23 +1,30 @@
 #!/usr/bin/env python3
-"""Visualize and quantify PointSLA point/text feature separability.
+"""Visualize and quantify PointSLA Point-Encoder / CLIP-text feature separation.
 
-The script loads a trained Stage-1 SSC checkpoint and compares:
-  1) raw PTv3 point features (64-D),
-  2) the SAME point samples after the learned semantic projector (512-D),
-  3) frozen text prototypes (one 512-D vector per Base class).
+The primary comparison is intentionally between:
+  1) raw Point Encoder features from the frozen PTv3 backbone (64-D), and
+  2) frozen CLIP text prototypes (one 512-D vector per Base class).
 
-For a fair sample-level comparison, (1) and (2) use exactly the same points and
-labels. Text prototypes have no within-class variance, so they are compared with
-point-class centroids at class level instead of using a sample-level silhouette.
+The semantic projector is NOT used in the primary analysis. This keeps the
+visualization focused on the intrinsic gap between the point-encoder feature
+space and the language feature space.
+
+Because the two sides have different sample semantics (many point samples per
+class versus one text prototype per class), the script produces:
+  1) <method>_point_vs_text.{pdf,png}
+     - Point Encoder: 1024 balanced point samples per eligible class by default.
+     - CLIP Text Encoder: one frozen text prototype per eligible class.
+  2) <method>_centroid_vs_text.{pdf,png}
+     - Point Encoder class centroids versus CLIP text prototypes, giving a fair
+       one-vector-per-class comparison.
 
 Outputs:
   sampled_features.npz
   metrics.json
   metrics.csv
   class_map.csv
-  <method>_point_vs_semantic.{pdf,png}
+  <method>_point_vs_text.{pdf,png}
   <method>_centroid_vs_text.{pdf,png}
-  <method>_semantic_text_alignment.{pdf,png}
   <method>_coordinates.npz
 
 Example:
@@ -31,9 +38,9 @@ Example:
 from __future__ import annotations
 
 import argparse
+import colorsys
 import csv
 import json
-import os
 import random
 import sys
 from collections import OrderedDict
@@ -63,7 +70,10 @@ DEFAULT_OUTPUT = "exp/scannetpp/feature_space_separability"
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="UMAP/t-SNE comparison of PTv3 and text-semantic feature spaces."
+        description=(
+            "UMAP/t-SNE comparison of raw Point Encoder features and "
+            "frozen CLIP text prototypes."
+        )
     )
     parser.add_argument("--config", default=DEFAULT_CONFIG)
     parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
@@ -74,14 +84,14 @@ def parse_args():
         default="auto",
         help="auto uses UMAP when available and otherwise falls back to t-SNE.",
     )
-    parser.add_argument("--max-points-per-class", type=int, default=128)
-    parser.add_argument("--min-points-per-class", type=int, default=32)
-    parser.add_argument("--max-per-scene-per-class", type=int, default=32)
+    parser.add_argument("--max-points-per-class", type=int, default=1024)
+    parser.add_argument("--min-points-per-class", type=int, default=1024)
+    parser.add_argument("--max-per-scene-per-class", type=int, default=256)
     parser.add_argument("--silhouette-sample-size", type=int, default=5000)
     parser.add_argument("--seed", type=int, default=3407)
     parser.add_argument("--dpi", type=int, default=300)
-    parser.add_argument("--point-size", type=float, default=7.0)
-    parser.add_argument("--point-alpha", type=float, default=0.72)
+    parser.add_argument("--point-size", type=float, default=4.0)
+    parser.add_argument("--point-alpha", type=float, default=0.58)
     return parser.parse_args()
 
 
@@ -123,7 +133,7 @@ def move_to_cuda(batch):
     return moved
 
 
-def collect_balanced_features(
+def collect_balanced_raw_features(
     model,
     dataset,
     num_classes: int,
@@ -131,9 +141,8 @@ def collect_balanced_features(
     max_per_scene_per_class: int,
     seed: int,
 ):
-    """Collect matching raw/semantic validation features with balanced sampling."""
+    """Collect raw Point Encoder validation features with class/scene balancing."""
     raw_parts = [[] for _ in range(num_classes)]
-    semantic_parts = [[] for _ in range(num_classes)]
     counts = np.zeros(num_classes, dtype=np.int64)
     scene_counts = np.zeros(num_classes, dtype=np.int64)
 
@@ -150,9 +159,6 @@ def collect_balanced_features(
                 point = model.backbone(Point(batch))
                 raw = point.feat if isinstance(point, Point) else point
                 raw = raw.detach().float()
-                semantic = model.semantic_projector(
-                    raw, detach_parameters=True
-                ).detach().float()
 
             if int(raw.shape[0]) != int(labels.shape[0]):
                 raise RuntimeError(
@@ -180,12 +186,16 @@ def collect_balanced_features(
                 if take <= 0:
                     continue
 
-                chosen_cpu = rng.choice(int(idx.numel()), size=take, replace=False)
-                chosen = idx[
-                    torch.as_tensor(chosen_cpu, device=idx.device, dtype=torch.long)
-                ]
+                selected_local = rng.choice(
+                    int(idx.numel()), size=take, replace=False
+                )
+                selected_local = torch.tensor(
+                    selected_local.tolist(),
+                    device=idx.device,
+                    dtype=torch.long,
+                )
+                chosen = idx[selected_local]
                 raw_parts[class_id].append(raw[chosen].cpu())
-                semantic_parts[class_id].append(semantic[chosen].cpu())
                 counts[class_id] += take
                 scene_counts[class_id] += 1
 
@@ -193,21 +203,17 @@ def collect_balanced_features(
                 break
 
     raw_by_class = []
-    semantic_by_class = []
     for class_id in range(num_classes):
         if raw_parts[class_id]:
             raw_by_class.append(torch.cat(raw_parts[class_id], dim=0))
-            semantic_by_class.append(torch.cat(semantic_parts[class_id], dim=0))
         else:
             raw_by_class.append(torch.empty((0, int(model.feature_dim))))
-            semantic_by_class.append(torch.empty((0, int(model.text_dim))))
 
-    return raw_by_class, semantic_by_class, counts, scene_counts
+    return raw_by_class, counts, scene_counts
 
 
 def build_equal_sample_arrays(
     raw_by_class,
-    semantic_by_class,
     class_names,
     min_points_per_class: int,
     max_points_per_class: int,
@@ -219,34 +225,39 @@ def build_equal_sample_arrays(
         if int(feature.shape[0]) >= min_points_per_class
     ]
     if len(eligible) < 2:
+        collected = [int(feature.shape[0]) for feature in raw_by_class]
         raise RuntimeError(
             "Fewer than two classes satisfy --min-points-per-class. "
-            "Reduce the threshold or inspect the validation labels."
+            f"Required={min_points_per_class}, collected={collected}. "
+            "Reduce the threshold only if you intentionally accept fewer "
+            "than 1024 point samples per class."
         )
 
     per_class = min(
         int(max_points_per_class),
         min(int(raw_by_class[class_id].shape[0]) for class_id in eligible),
     )
-    if per_class < 2:
-        raise RuntimeError("Balanced sample count per class is smaller than 2")
+    if per_class < min_points_per_class:
+        raise RuntimeError(
+            f"Balanced sample count {per_class} is below the requested "
+            f"minimum {min_points_per_class}."
+        )
 
     rng = np.random.default_rng(seed)
-    raw_all, semantic_all, labels_all = [], [], []
+    raw_all, labels_all = [], []
     selected_names, original_ids = [], []
 
     for new_id, class_id in enumerate(eligible):
         count = int(raw_by_class[class_id].shape[0])
         selected = rng.choice(count, size=per_class, replace=False)
-        raw_all.append(raw_by_class[class_id][selected].numpy())
-        semantic_all.append(semantic_by_class[class_id][selected].numpy())
+        selected_t = torch.tensor(selected.tolist(), dtype=torch.long)
+        raw_all.append(raw_by_class[class_id][selected_t].numpy())
         labels_all.append(np.full(per_class, new_id, dtype=np.int64))
         selected_names.append(str(class_names[class_id]))
         original_ids.append(int(class_id))
 
     return (
         np.concatenate(raw_all, axis=0).astype(np.float32, copy=False),
-        np.concatenate(semantic_all, axis=0).astype(np.float32, copy=False),
         np.concatenate(labels_all, axis=0),
         selected_names,
         original_ids,
@@ -318,8 +329,6 @@ def sample_separability_metrics(
         )
     )
 
-    # Held-out nearest-centroid classification. This is more interpretable than
-    # only judging 2-D UMAP/t-SNE geometry.
     rng = np.random.default_rng(seed)
     train_centroids = []
     test_x, test_y = [], []
@@ -353,26 +362,6 @@ def sample_separability_metrics(
         "min_inter_centroid_cosine_distance": float(inter.min()),
         "inter_over_intra_ratio": float(inter.mean() / max(intra.mean(), 1e-12)),
         "heldout_nearest_centroid_accuracy": float(np.mean(pred == test_y)),
-    }
-
-
-def semantic_text_alignment_metrics(semantic_centroids, text_prototypes):
-    semantic = l2_normalize(semantic_centroids)
-    text = l2_normalize(text_prototypes)
-    similarity = semantic @ text.T
-    diagonal = np.diag(similarity)
-    pred = np.argmax(similarity, axis=1)
-    target = np.arange(similarity.shape[0])
-
-    wrong = similarity.copy()
-    wrong[target, target] = -np.inf
-    margin = diagonal - np.max(wrong, axis=1)
-    return {
-        "mean_matched_cosine_similarity": float(diagonal.mean()),
-        "median_matched_cosine_similarity": float(np.median(diagonal)),
-        "mean_text_retrieval_margin": float(margin.mean()),
-        "min_text_retrieval_margin": float(margin.min()),
-        "text_prototype_top1_accuracy": float(np.mean(pred == target)),
     }
 
 
@@ -448,19 +437,31 @@ def reduce_2d(x: np.ndarray, method: str, seed: int, prototype_mode=False):
 
 
 def colors_for_classes(num_classes: int):
-    import matplotlib.pyplot as plt
-
-    cmap = plt.get_cmap("turbo")
-    if num_classes == 1:
-        return [cmap(0.5)]
-    return [cmap(i / (num_classes - 1)) for i in range(num_classes)]
+    """Generate a soft pastel palette while keeping classes distinguishable."""
+    if num_classes <= 0:
+        return []
+    colors = []
+    for i in range(num_classes):
+        hue = (i / max(num_classes, 1) + 0.035 * (i % 5)) % 1.0
+        saturation = 0.28 + 0.08 * (i % 3) / 2.0
+        value = 0.96 - 0.05 * (i % 4) / 3.0
+        colors.append(colorsys.hsv_to_rgb(hue, saturation, value))
+    return colors
 
 
 def style_axis(ax):
+    """Paper-style UMAP/t-SNE panel with an explicit rectangular frame."""
     ax.set_xticks([])
     ax.set_yticks([])
+    ax.set_facecolor("white")
+    try:
+        ax.set_box_aspect(1.0)
+    except AttributeError:
+        pass
     for spine in ax.spines.values():
-        spine.set_visible(False)
+        spine.set_visible(True)
+        spine.set_linewidth(1.15)
+        spine.set_edgecolor("black")
 
 
 def scatter_samples(ax, coords, labels, colors, point_size, alpha):
@@ -478,25 +479,35 @@ def scatter_samples(ax, coords, labels, colors, point_size, alpha):
     style_axis(ax)
 
 
-def scatter_prototypes(ax, coords, names, colors, marker="o", annotate=True):
-    for class_id, name in enumerate(names):
+def scatter_prototypes(
+    ax,
+    coords,
+    names,
+    colors,
+    marker="o",
+    annotate=True,
+    marker_size=58,
+):
+    for class_id, _name in enumerate(names):
         ax.scatter(
             coords[class_id, 0],
             coords[class_id, 1],
-            s=42,
+            s=marker_size,
             c=[colors[class_id]],
             marker=marker,
             edgecolors="black",
-            linewidths=0.35,
+            linewidths=0.45,
+            zorder=3,
         )
         if annotate:
             ax.text(
                 coords[class_id, 0],
                 coords[class_id, 1],
                 str(class_id),
-                fontsize=6,
+                fontsize=6.5,
                 ha="left",
                 va="bottom",
+                zorder=4,
             )
     style_axis(ax)
 
@@ -510,10 +521,8 @@ def plot_method(
     method,
     output_dir,
     raw,
-    semantic,
     labels,
     raw_centroids,
-    semantic_centroids,
     text_prototypes,
     class_names,
     seed,
@@ -525,101 +534,79 @@ def plot_method(
 
     colors = colors_for_classes(len(class_names))
 
-    print(f"[{method}] Reducing raw point samples: {raw.shape}")
+    # Primary figure: the raw point-encoder sample distribution versus the
+    # frozen CLIP text-prototype distribution. These embeddings are performed
+    # separately because the original spaces are 64-D and 512-D, respectively.
+    print(f"[{method}] Reducing Point Encoder samples: {raw.shape}")
     raw_xy = reduce_2d(raw, method, seed, prototype_mode=False)
-    print(f"[{method}] Reducing semantic point samples: {semantic.shape}")
-    semantic_xy = reduce_2d(semantic, method, seed, prototype_mode=False)
+    print(f"[{method}] Reducing CLIP text prototypes: {text_prototypes.shape}")
+    text_xy = reduce_2d(
+        text_prototypes, method, seed + 1, prototype_mode=True
+    )
 
-    fig, axes = plt.subplots(1, 2, figsize=(10.0, 4.4))
+    fig, axes = plt.subplots(1, 2, figsize=(9.2, 4.6))
     scatter_samples(
         axes[0], raw_xy, labels, colors, point_size, point_alpha
     )
-    scatter_samples(
-        axes[1], semantic_xy, labels, colors, point_size, point_alpha
+    scatter_prototypes(
+        axes[1],
+        text_xy,
+        class_names,
+        colors,
+        marker="o",
+        annotate=True,
+        marker_size=64,
     )
-    axes[0].set_title("PTv3 Point Features (64-D)", fontsize=12, fontweight="bold")
-    axes[1].set_title(
-        "Projected Semantic Features (512-D)", fontsize=12, fontweight="bold"
-    )
-    fig.tight_layout()
-    save_figure(fig, output_dir / f"{method}_point_vs_semantic", dpi)
+    axes[0].set_title("Point Encoder", fontsize=13, fontweight="bold", pad=8)
+    axes[1].set_title("CLIP Text Encoder", fontsize=13, fontweight="bold", pad=8)
+    fig.tight_layout(w_pad=2.0)
+    save_figure(fig, output_dir / f"{method}_point_vs_text", dpi)
     plt.close(fig)
 
-    print(f"[{method}] Reducing class centroids and text prototypes")
+    # Fair class-level figure: one point centroid versus one text prototype per
+    # class. Each panel is still reduced separately because the feature
+    # dimensionalities differ.
+    print(f"[{method}] Reducing Point Encoder class centroids")
     raw_centroid_xy = reduce_2d(
-        raw_centroids, method, seed + 1, prototype_mode=True
-    )
-    text_xy = reduce_2d(
-        text_prototypes, method, seed + 2, prototype_mode=True
+        raw_centroids, method, seed + 2, prototype_mode=True
     )
 
-    fig, axes = plt.subplots(1, 2, figsize=(10.0, 4.4))
+    fig, axes = plt.subplots(1, 2, figsize=(9.2, 4.6))
     scatter_prototypes(
-        axes[0], raw_centroid_xy, class_names, colors, marker="o", annotate=True
+        axes[0],
+        raw_centroid_xy,
+        class_names,
+        colors,
+        marker="o",
+        annotate=True,
+        marker_size=60,
     )
     scatter_prototypes(
-        axes[1], text_xy, class_names, colors, marker="*", annotate=True
+        axes[1],
+        text_xy,
+        class_names,
+        colors,
+        marker="o",
+        annotate=True,
+        marker_size=64,
     )
-    axes[0].set_title("Point-Class Centroids (64-D)", fontsize=12, fontweight="bold")
-    axes[1].set_title("Frozen Text Prototypes (512-D)", fontsize=12, fontweight="bold")
-    fig.tight_layout()
-    save_figure(fig, output_dir / f"{method}_centroid_vs_text", dpi)
-    plt.close(fig)
-
-    # Semantic centroids and text prototypes share the same 512-D CLIP space,
-    # so they can be embedded jointly to visualize semantic alignment directly.
-    joint = np.concatenate([semantic_centroids, text_prototypes], axis=0)
-    joint_xy = reduce_2d(joint, method, seed + 3, prototype_mode=True)
-    semantic_centroid_xy = joint_xy[: len(class_names)]
-    text_joint_xy = joint_xy[len(class_names) :]
-
-    fig, ax = plt.subplots(1, 1, figsize=(5.4, 5.0))
-    for class_id, name in enumerate(class_names):
-        c = colors[class_id]
-        p = semantic_centroid_xy[class_id]
-        t = text_joint_xy[class_id]
-        ax.plot(
-            [p[0], t[0]],
-            [p[1], t[1]],
-            linewidth=0.65,
-            alpha=0.45,
-            color=c,
-        )
-        ax.scatter(
-            p[0], p[1], s=34, c=[c], marker="o", edgecolors="black", linewidths=0.3
-        )
-        ax.scatter(
-            t[0], t[1], s=58, c=[c], marker="*", edgecolors="black", linewidths=0.3
-        )
-        ax.text(t[0], t[1], str(class_id), fontsize=6, ha="left", va="bottom")
-    style_axis(ax)
-    ax.set_title(
-        "Semantic Point Centroids vs. Text Prototypes",
-        fontsize=12,
+    axes[0].set_title(
+        "Point Encoder (Class Centroids)",
+        fontsize=13,
         fontweight="bold",
+        pad=8,
     )
-    ax.text(
-        0.01,
-        0.01,
-        "circle: projected point centroid   star: text prototype",
-        transform=ax.transAxes,
-        fontsize=7,
-        ha="left",
-        va="bottom",
-    )
-    fig.tight_layout()
-    save_figure(fig, output_dir / f"{method}_semantic_text_alignment", dpi)
+    axes[1].set_title("CLIP Text Encoder", fontsize=13, fontweight="bold", pad=8)
+    fig.tight_layout(w_pad=2.0)
+    save_figure(fig, output_dir / f"{method}_centroid_vs_text", dpi)
     plt.close(fig)
 
     np.savez(
         output_dir / f"{method}_coordinates.npz",
-        raw_point_xy=raw_xy,
-        semantic_point_xy=semantic_xy,
+        point_encoder_xy=raw_xy,
         labels=labels,
-        raw_centroid_xy=raw_centroid_xy,
-        text_prototype_xy=text_xy,
-        joint_semantic_centroid_xy=semantic_centroid_xy,
-        joint_text_prototype_xy=text_joint_xy,
+        point_centroid_xy=raw_centroid_xy,
+        clip_text_xy=text_xy,
     )
 
 
@@ -636,13 +623,17 @@ def flatten_metrics(metrics):
 def main():
     args = parse_args()
     if not torch.cuda.is_available():
-        raise RuntimeError("A CUDA GPU is required to extract PTv3 features")
+        raise RuntimeError("A CUDA GPU is required to extract Point Encoder features")
     if args.max_points_per_class <= 1:
         raise ValueError("--max-points-per-class must be > 1")
     if args.min_points_per_class <= 1:
         raise ValueError("--min-points-per-class must be > 1")
     if args.max_per_scene_per_class <= 0:
         raise ValueError("--max-per-scene-per-class must be positive")
+    if args.min_points_per_class > args.max_points_per_class:
+        raise ValueError(
+            "--min-points-per-class cannot exceed --max-points-per-class"
+        )
 
     set_seed(args.seed)
     config_path = Path(args.config).resolve()
@@ -679,17 +670,18 @@ def main():
         class_names = [f"class_{i}" for i in range(int(model.num_classes))]
 
     print("============================================================")
-    print("PointSLA feature-space separability")
-    print(f"Config      : {config_path}")
-    print(f"Checkpoint  : {checkpoint_path}")
-    print(f"Output      : {output_dir}")
-    print(f"Base classes: {model.num_classes}")
-    print(f"Point dim   : {model.feature_dim}")
-    print(f"Text dim    : {model.text_dim}")
+    print("PointSLA Point Encoder / CLIP Text Encoder feature comparison")
+    print(f"Config       : {config_path}")
+    print(f"Checkpoint   : {checkpoint_path}")
+    print(f"Output       : {output_dir}")
+    print(f"Base classes : {model.num_classes}")
+    print(f"Point dim    : {model.feature_dim}")
+    print(f"Text dim     : {model.text_dim}")
+    print(f"Target/class : {args.max_points_per_class}")
     print("============================================================")
 
     val_dataset = build_dataset(cfg.data.val)
-    raw_by_class, semantic_by_class, collected, scene_counts = collect_balanced_features(
+    raw_by_class, collected, scene_counts = collect_balanced_raw_features(
         model=model,
         dataset=val_dataset,
         num_classes=int(model.num_classes),
@@ -700,14 +692,12 @@ def main():
 
     (
         raw,
-        semantic,
         labels,
         selected_names,
         original_ids,
         balanced_per_class,
     ) = build_equal_sample_arrays(
         raw_by_class=raw_by_class,
-        semantic_by_class=semantic_by_class,
         class_names=class_names,
         min_points_per_class=args.min_points_per_class,
         max_points_per_class=args.max_points_per_class,
@@ -715,60 +705,43 @@ def main():
     )
 
     raw = l2_normalize(raw).astype(np.float32)
-    semantic = l2_normalize(semantic).astype(np.float32)
+
+    selected_index = torch.tensor(original_ids, dtype=torch.long)
     text_selected = F.normalize(
-        text_all[torch.as_tensor(original_ids, dtype=torch.long)],
+        text_all[selected_index],
         dim=-1,
         eps=1e-6,
     ).numpy().astype(np.float32)
 
     raw_centroids = class_centroids(raw, labels)
-    semantic_centroids = class_centroids(semantic, labels)
 
     raw_metrics = sample_separability_metrics(
         raw, labels, args.seed, args.silhouette_sample_size
     )
-    semantic_metrics = sample_separability_metrics(
-        semantic, labels, args.seed, args.silhouette_sample_size
-    )
     raw_centroid_metrics = prototype_distance_metrics(raw_centroids)
-    semantic_centroid_metrics = prototype_distance_metrics(semantic_centroids)
     text_metrics = prototype_distance_metrics(text_selected)
-    alignment_metrics = semantic_text_alignment_metrics(
-        semantic_centroids, text_selected
-    )
 
     metrics = {
-        "raw_point_features_64d": raw_metrics,
-        "projected_semantic_features_512d": semantic_metrics,
-        "raw_point_class_centroids_64d": raw_centroid_metrics,
-        "semantic_point_class_centroids_512d": semantic_centroid_metrics,
-        "frozen_text_prototypes_512d": text_metrics,
-        "semantic_text_alignment": alignment_metrics,
+        "point_encoder_features_64d": raw_metrics,
+        "point_encoder_class_centroids_64d": raw_centroid_metrics,
+        "clip_text_prototypes_512d": text_metrics,
         "comparison": {
-            "silhouette_gain_semantic_minus_raw": float(
-                semantic_metrics["silhouette_cosine"]
-                - raw_metrics["silhouette_cosine"]
-            ),
-            "inter_over_intra_ratio_gain": float(
-                semantic_metrics["inter_over_intra_ratio"]
-                - raw_metrics["inter_over_intra_ratio"]
-            ),
-            "nearest_centroid_accuracy_gain": float(
-                semantic_metrics["heldout_nearest_centroid_accuracy"]
-                - raw_metrics["heldout_nearest_centroid_accuracy"]
-            ),
-            "text_minus_raw_centroid_mean_pairwise_cosine_distance": float(
+            "text_minus_point_centroid_mean_pairwise_cosine_distance": float(
                 text_metrics["mean_pairwise_cosine_distance"]
                 - raw_centroid_metrics["mean_pairwise_cosine_distance"]
             ),
-            "text_minus_raw_centroid_min_pairwise_cosine_distance": float(
+            "text_minus_point_centroid_median_pairwise_cosine_distance": float(
+                text_metrics["median_pairwise_cosine_distance"]
+                - raw_centroid_metrics["median_pairwise_cosine_distance"]
+            ),
+            "text_minus_point_centroid_min_pairwise_cosine_distance": float(
                 text_metrics["min_pairwise_cosine_distance"]
                 - raw_centroid_metrics["min_pairwise_cosine_distance"]
             ),
         },
         "sampling": {
             "balanced_points_per_class": int(balanced_per_class),
+            "total_point_samples": int(len(labels)),
             "num_selected_classes": int(len(selected_names)),
             "max_points_per_class": int(args.max_points_per_class),
             "min_points_per_class": int(args.min_points_per_class),
@@ -779,6 +752,10 @@ def main():
             "config": str(config_path),
             "checkpoint": str(checkpoint_path),
             "checkpoint_epoch": checkpoint.get("epoch", None),
+            "primary_comparison": (
+                "raw Point Encoder features versus frozen CLIP text prototypes; "
+                "semantic projector excluded"
+            ),
         },
     }
 
@@ -815,12 +792,10 @@ def main():
 
     np.savez(
         output_dir / "sampled_features.npz",
-        raw_point_features=raw,
-        semantic_point_features=semantic,
+        point_encoder_features=raw,
         labels=labels,
-        raw_point_centroids=raw_centroids,
-        semantic_point_centroids=semantic_centroids,
-        text_prototypes=text_selected,
+        point_encoder_centroids=raw_centroids,
+        clip_text_prototypes=text_selected,
         original_base_labels=np.asarray(original_ids, dtype=np.int64),
         class_names=np.asarray(selected_names, dtype=object),
     )
@@ -831,10 +806,8 @@ def main():
             method=method,
             output_dir=output_dir,
             raw=raw,
-            semantic=semantic,
             labels=labels,
             raw_centroids=raw_centroids,
-            semantic_centroids=semantic_centroids,
             text_prototypes=text_selected,
             class_names=selected_names,
             seed=args.seed,
@@ -846,40 +819,40 @@ def main():
     print("\nQuantitative comparison")
     print("-----------------------")
     print(
-        "Raw 64-D silhouette        : "
+        "Point Encoder samples/class : "
+        f"{balanced_per_class}"
+    )
+    print(
+        "Total Point Encoder samples : "
+        f"{len(labels)}"
+    )
+    print(
+        "Selected Base classes       : "
+        f"{len(selected_names)}"
+    )
+    print(
+        "Point silhouette            : "
         f"{raw_metrics['silhouette_cosine']:.6f}"
     )
     print(
-        "Semantic 512-D silhouette  : "
-        f"{semantic_metrics['silhouette_cosine']:.6f}"
-    )
-    print(
-        "Raw inter/intra ratio       : "
+        "Point inter/intra ratio      : "
         f"{raw_metrics['inter_over_intra_ratio']:.6f}"
     )
     print(
-        "Semantic inter/intra ratio  : "
-        f"{semantic_metrics['inter_over_intra_ratio']:.6f}"
-    )
-    print(
-        "Raw centroid accuracy       : "
+        "Point centroid accuracy      : "
         f"{raw_metrics['heldout_nearest_centroid_accuracy']:.6f}"
     )
     print(
-        "Semantic centroid accuracy  : "
-        f"{semantic_metrics['heldout_nearest_centroid_accuracy']:.6f}"
-    )
-    print(
-        "Raw centroid mean distance  : "
+        "Point centroid mean distance : "
         f"{raw_centroid_metrics['mean_pairwise_cosine_distance']:.6f}"
     )
     print(
-        "Text prototype mean distance: "
+        "CLIP text mean distance      : "
         f"{text_metrics['mean_pairwise_cosine_distance']:.6f}"
     )
     print(
-        "Semantic->text top-1        : "
-        f"{alignment_metrics['text_prototype_top1_accuracy']:.6f}"
+        "CLIP-text minus point-centroid mean distance: "
+        f"{metrics['comparison']['text_minus_point_centroid_mean_pairwise_cosine_distance']:.6f}"
     )
     print(f"\nSaved to: {output_dir}")
 
