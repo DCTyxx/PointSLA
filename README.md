@@ -5,9 +5,28 @@
   Local Subspace Learning + Semantic Scale Calibration + Virtual Feature Augmentation
 </p>
 
-> **Active research branch:** `feature/cdc-base-geometry-step1`
+> **Repository:** `DCTyxx/PointSLA`  
+> **Default branch:** `feature/cdc-base-geometry-step1`
 >
-> This repository extends the original GFS-VL codebase with our PointSLA framework. Some implementation files retain historical `CDC` names for compatibility, while the paper-level modules are referred to as **LSL** and **SSC**.
+> PointSLA is developed on top of the original GFS-VL codebase. Historical `CDC` names are retained in several implementation files for backward compatibility, while the paper-level modules are referred to as **LSL** and **SSC**.
+
+---
+
+## Quick Start
+
+Clone the current PointSLA repository:
+
+```bash
+git clone https://github.com/DCTyxx/PointSLA.git
+cd PointSLA
+git checkout feature/cdc-base-geometry-step1
+```
+
+If an existing local checkout still points to the former repository name, update the remote with:
+
+```bash
+git remote set-url origin https://github.com/DCTyxx/PointSLA.git
+```
 
 ---
 
@@ -243,8 +262,10 @@ visilization/
 They support synchronized views of:
 
 ```text
-Input | GFS-VL | PointSLA (Ours) | Ground Truth
+Input | GFS-VL Baseline | PointSLA (Ours) | Ground Truth
 ```
+
+Here, **GFS-VL Baseline** explicitly denotes the original baseline method and is intentionally retained as a method name rather than a repository/project name.
 
 ---
 
@@ -289,7 +310,7 @@ data/ScanNetpp
 
 ## Environment
 
-The project is based on Pointcept/PTv3 and the original GFS-VL codebase. A typical environment requires:
+PointSLA is based on Pointcept/PTv3 and extends the original GFS-VL implementation. A typical environment requires:
 
 - Python 3.10+
 - PyTorch 2.x
@@ -309,34 +330,31 @@ pip install umap-learn scikit-learn matplotlib
 ## Repository Structure
 
 ```text
-configs/
-  scannet/
-  scannet200/
-  scannetpp/
-
-pointcept/models/
-  cdc_base_geometry.py
-  tangent_cdc_base_geometry.py
-  semantic_tangent_cdc_base_geometry.py
-  boundary_semantic_tangent_cdc_base_geometry.py
-  stage2_phase2_cdc_adapt.py
-  stage2_phase3_cdc_aug.py
-
-scripts/
-  run_scannet_cdc_full_pipeline.sh
-  run_scannet200_cdc_full_pipeline.sh
-  run_scannetpp_cdc_full_pipeline.sh
-  run_scannetpp_k1_direction_ablation.sh
-  run_split_phase2_lsl_posthoc_eval.sh
-  run_phase3_virtual_samples_ablation.sh
-  run_scannetpp_point_text_umap.sh
-
-tools/
-  eval_phase2_lsl_metrics.py
-  export_phase3_feature_pairs.py
-  visualize_point_text_feature_space.py
-
-visilization/
+PointSLA/
+├── configs/
+│   ├── scannet/
+│   ├── scannet200/
+│   └── scannetpp/
+├── pointcept/models/
+│   ├── cdc_base_geometry.py
+│   ├── tangent_cdc_base_geometry.py
+│   ├── semantic_tangent_cdc_base_geometry.py
+│   ├── boundary_semantic_tangent_cdc_base_geometry.py
+│   ├── stage2_phase2_cdc_adapt.py
+│   └── stage2_phase3_cdc_aug.py
+├── scripts/
+│   ├── run_scannet_cdc_full_pipeline.sh
+│   ├── run_scannet200_cdc_full_pipeline.sh
+│   ├── run_scannetpp_cdc_full_pipeline.sh
+│   ├── run_scannetpp_k1_direction_ablation.sh
+│   ├── run_split_phase2_lsl_posthoc_eval.sh
+│   ├── run_phase3_virtual_samples_ablation.sh
+│   └── run_scannetpp_point_text_umap.sh
+├── tools/
+│   ├── eval_phase2_lsl_metrics.py
+│   ├── export_phase3_feature_pairs.py
+│   └── visualize_point_text_feature_space.py
+└── visilization/
 ```
 
 ---
@@ -351,11 +369,13 @@ In the current PointSLA formulation:
 - semantic projector + conservative radius estimation corresponds to **Semantic Scale Calibration (SSC)**
 - Phase-3 feature synthesis corresponds to **subspace-guided virtual feature augmentation**
 
+Legacy configuration names such as `gfspretrain`, `gfsregistrain`, and some variables related to the original GFS-VL baseline are intentionally retained because they are part of the executable training/evaluation interface. They should not be interpreted as the current repository name.
+
 ---
 
 ## Acknowledgement
 
-This repository is built upon the original **GFS-VL: Generalized Few-shot 3D Point Cloud Segmentation with Vision-Language Model** implementation and the excellent open-source projects Pointcept, PTv3, RegionPLC/PLA, OpenScene, and COSeg.
+PointSLA is built upon the original **GFS-VL: Generalized Few-shot 3D Point Cloud Segmentation with Vision-Language Model** implementation and the excellent open-source projects Pointcept, PTv3, RegionPLC/PLA, OpenScene, and COSeg.
 
 We thank the authors of these projects for making their code and benchmarks publicly available.
 
