@@ -1,274 +1,377 @@
-<p align="center">
-  <h1 align="center">Generalized Few-shot 3D Point Cloud Segmentation with Vision-Language Model</h1>
-  <p align="center">
-    <a href="https://zhaochongan.github.io/"><strong>Zhaochong An</strong></a>
-    ·
-    <a href="https://guoleisun.github.io/"><strong>Guolei Sun<sup>†</sup></strong></a>
-    ·
-    <a href="https://yun-liu.github.io/"><strong>Yun Liu<sup>†</sup></strong></a>
-    ·
-    <a href="https://runjiali-rl.github.io/"><strong>Runjia Li</strong></a>
-    ·
-    <a href="https://junlinhan.github.io/"><strong>Junlin Han</strong></a>
-    <br>
-    <a href="https://people.ee.ethz.ch/~kender/"><strong>Ender Konukoglu</strong></a>
-    ·
-    <a href="https://sergebelongie.github.io/"><strong>Serge Belongie</strong></a>
-  </p>
-  <h2 align="center">CVPR 2025 (<a href="https://arxiv.org/pdf/2503.16282">Paper</a>)</h2>
-</p>
+# PointSLA: Subspace Learning and Augmentation with Vision-Language Models for Few-Shot Point Cloud Segmentation
 
 <p align="center">
-  <img src="./docs/GFS_VL.png" alt="Overview" width="100%">
+  <b>Generalized Few-Shot 3D Point Cloud Segmentation</b><br>
+  Local Subspace Learning + Semantic Scale Calibration + Virtual Feature Augmentation
 </p>
 
-
-## 🌟 Highlights
-
-
-### Key Contributions:
-
-**Model Side:**
-
-- **GFS-VL Framework:** A novel approach for generalized few-shot 3D point cloud segmentation (GFS-PCS) that combines **Dense yet noisy knowledge** from 3D Vision-Language Models and **Precise yet sparse few-shot samples** to achieve superior novel class generalization.
-
-**Benchmarking Side:**
-
-- Introduces **two challenging GFS-PCS benchmarks with diverse novel classes** for extensive generalization evaluation, laying a solid foundation for real-world GFS-PCS advancements.
-
-
-## 📝 Citation
-If you find our work useful, please cite our work:
-```bibtex
-@inproceedings{an2025generalized,
-  title={Generalized few-shot 3d point cloud segmentation with vision-language model},
-  author={An, Zhaochong and Sun, Guolei and Liu, Yun and Li, Runjia and Han, Junlin and Konukoglu, Ender and Belongie, Serge},
-  booktitle={2025 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-  pages={16997--17007},
-  year={2025},
-  organization={IEEE}
-}
-
-@inproceedings{an2025multimodality,
-  title={Multimodality helps few-shot 3d point cloud semantic segmentation},
-  author={An, Zhaochong and Sun, Guolei and Liu, Yun and Li, Runjia and Wu, Min and Cheng, Ming-Ming and Konukoglu, Ender and Belongie, Serge},
-  booktitle={International Conference on Learning Representations},
-  volume={2025},
-  pages={55414--55435},
-  year={2025}
-}
-
-
-@inproceedings{an2024rethinking,
-  title={Rethinking few-shot 3d point cloud semantic segmentation},
-  author={An, Zhaochong and Sun, Guolei and Liu, Yun and Liu, Fayao and Wu, Zongwei and Wang, Dan and Van Gool, Luc and Belongie, Serge},
-  booktitle={2024 IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-  pages={3996--4006},
-  year={2024},
-  organization={IEEE}
-}
-```
----
-
-## 📖 Table of Contents
-
-- [Installation](#%EF%B8%8F-installation)
-- [Data Preparation](#-data-preparation)
-- [Training](#-training)
-- [Evaluation & Visualization](#-evaluation--visualization)
-- [Model Zoo](#-model-zoo)
-- [Acknowledgement](#acknowledgement)
+> **Active research branch:** `feature/cdc-base-geometry-step1`
+>
+> This repository extends the original GFS-VL codebase with our PointSLA framework. Some implementation files retain historical `CDC` names for compatibility, while the paper-level modules are referred to as **LSL** and **SSC**.
 
 ---
 
+## Overview
 
-## 🛠️ Installation
+Generalized few-shot point cloud segmentation aims to extend a base-trained point cloud segmentation model to novel classes using only a small annotated support set, while retaining its ability to segment base classes in the same scene.
 
-### Requirements
+PointSLA addresses a key limitation of few-shot adaptation: sparse novel-class support samples provide insufficient coverage of local intra-class feature variations. Our framework learns transferable local feature subspaces from base classes, calibrates admissible expansion scales with frozen vision-language semantics, and generates virtual point features to improve novel-class adaptation without sacrificing base-class performance.
 
-- **CUDA**: 11.8 and above
-- **PyTorch**: 1.13.0 and above
+The framework contains two core components:
 
-Our environment is tested on both RTX 3090 and A100 GPUs.
+- **Local Subspace Learning (LSL)** learns local intra-class variation directions from geometric neighborhoods while explicitly suppressing inter-class intrusion.
+- **Semantic Scale Calibration (SSC)** projects point features into a frozen CLIP text space and estimates a conservative feature expansion radius that preserves target-class similarity and inter-class semantic margins.
 
-### Environment Setup:
+The learned directions and calibrated scales are then used to synthesize virtual features for few-shot adaptation.
 
-**Manual Setup**
+---
+
+## Method
+
+### 1. Local Subspace Learning
+
+Given a point feature \(\mathbf{z}_i \in \mathbb{R}^{D}\), LSL predicts a low-rank local basis
+
+\[
+\mathbf{Q}_i \in \mathbb{R}^{D \times r},
+\qquad
+\mathbf{Q}_i^{\top}\mathbf{Q}_i = \mathbf{I}.
+\]
+
+An empirical local tangent basis is constructed from same-class neighbors using SVD. The learned basis is optimized to align with this empirical subspace while maintaining discrimination against different-class neighborhoods.
+
+Main settings used in the current implementation:
+
+- feature dimension: `D = 64`
+- local subspace rank: `r = 24`
+- same-class neighbors: `K+ = 32`
+- different-class neighbors: `K- = 32`
+- discriminative margin: `0.05`
+- discriminative loss weight: `0.1`
+
+The codebase still uses the historical `CDC` naming in several files, but this module corresponds to the paper-level **LSL** component.
+
+### 2. Semantic Scale Calibration
+
+SSC maps point features into the frozen CLIP text space through a learned semantic projector:
+
+\[
+\mathbf{e}_i = g(\mathbf{z}_i) \in \mathbb{R}^{512}.
+\]
+
+For a Base-class label \(y_i\), semantic consistency is evaluated using target-class similarity and the margin against competing Base classes. A candidate expansion radius is accepted only when all probe points preserve both quantities within a small tolerance.
+
+Current semantic constraints use:
+
+- text feature dimension: `512`
+- target similarity tolerance: `0.005`
+- inter-class margin tolerance: `0.005`
+- path probes: `{0.25, 0.50, 0.75, 1.00}`
+
+The resulting safe radius controls how far a feature may be expanded along its learned local subspace.
+
+### 3. Virtual Feature Augmentation
+
+For a support feature \(\mathbf{z}\), PointSLA generates a virtual feature as
+
+\[
+\tilde{\mathbf{z}}
+=
+\mathbf{z}
++
+\rho\,\|\mathbf{z}\|\,\mathbf{Q}(\mathbf{z})\bar{\mathbf{a}},
+\]
+
+where \(\rho\) is the calibrated expansion scale and \(\bar{\mathbf{a}}\) is a normalized coefficient vector sampled in the learned local subspace.
+
+These virtual features improve coverage of novel-class feature variation while keeping augmentation semantically conservative.
+
+---
+
+## Training Pipeline
+
+The current implementation follows a staged training pipeline.
+
+### Stage 1: Base Geometry and Semantic Calibration
+
+- freeze PTv3 backbone
+- freeze Base segmentation head
+- learn LSL/CDC geometry
+- learn semantic projector
+- learn conservative safe-radius head
+- use Base-class supervision only
+
+For ScanNet++:
 
 ```bash
-python -m venv gfs_vl
-source gfs_vl/bin/activate
-
-pip install torch==2.1.0 torchvision==0.16.0 torchaudio==2.1.0 --index-url https://download.pytorch.org/whl/cu118
-pip install h5py pyyaml ninja sharedarray tensorboard tensorboardx addict einops scipy plyfile termcolor timm urllib3 fsspec==2024.2.0 easydict==1.13 yapf==0.40.1
-pip install torch-cluster torch-scatter torch-sparse -f https://data.pyg.org/whl/torch-2.1.0+cu118.html
-pip install torch-geometric
-pip install git+https://github.com/openai/CLIP.git
-pip install flash-attn --no-build-isolation
-pip install spconv-cu118 # see https://github.com/traveller59/spconv for details
-
-# Pointops CUDA Dependencies (choose one of the three options)
-cd libs/pointops
-# Option 1: Standard install
-python setup.py install
-# Option 2: Docker & Multi-GPU arch
-TORCH_CUDA_ARCH_LIST="ARCH LIST" python setup.py install
-# Option 3: For RTX 3090 (8.6) or A100 (8.0). More details in: https://arnon.dk/matching-sm-architectures-arch-and-gencode-for-various-nvidia-cards/
-TORCH_CUDA_ARCH_LIST="8.0" python setup.py install
-
-# For the second CUDA dependency, use the same one of three above build options
-cd ../../libs/pointops2
-TORCH_CUDA_ARCH_LIST="8.0" python setup.py install
+GPU_LIST=0,3,5 \
+bash scripts/run_scannetpp_cdc_full_pipeline.sh
 ```
 
-After above steps, install dependencies for the 3D vision-language models (RegionPLC). Refer to the [RegionPLC installation guide](https://github.com/CVMI-Lab/PLA/blob/regionplc/docs/INSTALL.md).
+The full pipeline script automatically launches all later phases after Stage 1.
 
-```bash
-cd pointcept/models/PLA
-TORCH_CUDA_ARCH_LIST="8.0" python3 setup.py develop
+### Stage 2 Phase 1: Few-Shot Task Adaptation
 
-# Install softgroup_ops:
-cd pcseg/external_libs/softgroup_ops
-TORCH_CUDA_ARCH_LIST="8.0" python setup.py build_ext develop
+For each fixed registration/support split:
 
-# If the direct install fails, follow these steps:
-# 1. Download google-sparsehash-2.0.3-1.tar.bz2 from:
-#    https://anaconda.org/bioconda/google-sparsehash/files
-# 2. Extract it:
-tar -I pigz -xvjf google-sparsehash-2.0.3-1.tar.bz2 -C ./google-sparsehash
-# 3. Set include path:
-export CPLUS_INCLUDE_PATH=$(pwd)/google-sparsehash/include:$CPLUS_INCLUDE_PATH
-# 4. Build with the include directories:
-TORCH_CUDA_ARCH_LIST="8.0" python setup.py build_ext --include-dirs=$CPLUS_INCLUDE_PATH develop
-```
+- adapt PTv3 task model and Base/Novel classification heads
+- keep the Stage-1 geometry stack frozen
+- run each registration independently to avoid state leakage
 
-## 📦 Data Preparation
+Both 1-shot and 5-shot settings use five registration splits.
 
-We follow the [Pointcept Data Guidelines](https://github.com/Pointcept/Pointcept#data-preparation).
+### Stage 2 Phase 2: Local Subspace Adaptation
 
-### ScanNet & ScanNet200
+- freeze the task model
+- adapt the LSL/CDC component using trusted Base GT and K-shot Novel GT
+- ignore unknown/unlabeled points
+- do not use VLM pseudo labels for this phase
 
-1. Download the [ScanNet v2 dataset](http://www.scan-net.org/).
-2. Preprocess the raw data:
-    ```bash
-    # Set RAW_SCANNET_DIR to your downloaded dataset directory
-    # Set PROCESSED_SCANNET_DIR to the desired output directory
-    python pointcept/datasets/preprocessing/scannet/preprocess_scannet.py \
-      --dataset_root ${RAW_SCANNET_DIR} \
-      --output_root ${PROCESSED_SCANNET_DIR}
-    ```
+### Stage 2 Phase 3: Virtual Feature Refinement
 
-- *(Alternative)*: Download our preprocessed data from [here](https://huggingface.co/datasets/ZhaochongAn/GFS_PCS_Datasets/blob/main/ScanNet200.tar.gz) (please agree to the official license).
+- freeze PTv3
+- freeze LSL/CDC
+- freeze Base classifier
+- refine the Novel classifier with real and virtual Novel features
 
+The expansion radius can be automatically read from Stage-1 conservative semantic calibration.
 
-After obtaining the dataset, either set `data_root` in configs to `${PROCESSED_SCANNET_DIR}` or link the processed data:
-  ```bash
-  ln -s ${PROCESSED_SCANNET_DIR} ${CODEBASE_DIR}/data/ScanNet200
-  ```
+---
+
+## Current Results
+
+### ScanNet200
+
+| Setting | Base mIoU | Novel mIoU | All mIoU | HM |
+|---|---:|---:|---:|---:|
+| 1-shot | 69.16 | 30.30 | 38.48 | 42.13 |
+| 5-shot | 68.89 | 32.85 | 40.43 | 44.49 |
 
 ### ScanNet++
 
-1. Download the [ScanNet++ dataset](https://kaldir.vc.in.tum.de/scannetpp/).
-2. Preprocess the raw data:
-    ```bash
-    # Set RAW_SCANNETPP_DIR to your downloaded dataset directory
-    # Set PROCESSED_SCANNETPP_DIR to the desired output directory
-    # NUM_WORKERS: number of parallel workers
-    python pointcept/datasets/preprocessing/scannetpp/preprocess_scannetpp.py \
-      --dataset_root ${RAW_SCANNETPP_DIR} \
-      --output_root ${PROCESSED_SCANNETPP_DIR} \
-      --num_workers ${NUM_WORKERS}
-    ```
-3. Sampling and chunking large point cloud data in train/val split (for training only):
-    ```bash
-    # For the training split (change --split to val for the validation split):
-    python pointcept/datasets/preprocessing/sampling_chunking_data.py \
-      --dataset_root ${PROCESSED_SCANNETPP_DIR} \
-      --grid_size 0.01 \
-      --chunk_range 6 6 \
-      --chunk_stride 3 3 \
-      --split train \
-      --num_workers ${NUM_WORKERS}
-    ```
+| Setting | Base mIoU | Novel mIoU | All mIoU | HM |
+|---|---:|---:|---:|---:|
+| 1-shot | 62.94 | 23.17 | 39.08 | 33.84 |
+| 5-shot | 62.05 | 27.43 | 41.28 | 38.03 |
 
-- *(Alternative)* Download our preprocessed data directly from [here](https://huggingface.co/datasets/ZhaochongAn/GFS_PCS_Datasets/blob/main/ScanNetpp.tar.gz) (please agree to the official license).
+---
 
-After obtaining the dataset, either set `data_root` in configs to `${PROCESSED_SCANNET_DIR}` or link the processed data:
-  ```bash
-  ln -s ${PROCESSED_SCANNETPP_DIR} ${CODEBASE_DIR}/data/ScanNetpp
-  ```
+## Ablation Utilities
 
-## 🔄 Training
+### Direction Ablation
 
-### 1. Backbone Pretraining
+The ScanNet++ 1-shot direction ablation compares:
 
-- **Option A**: Download our [Pretrained weights](https://huggingface.co/ZhaochongAn/GFS_VL/tree/main/backbone_weights)
-- **Option B**: Train from scratch using the pretrain config from the `configs` folder. Training outputs will be saved into the folder specified by `${EXP_NAME}`.
+1. real-only training
+2. isotropic random directions
+3. random low-rank subspace
+4. local PCA directions
+5. learned LSL/CDC directions
 
-  ```bash
-  sh scripts/train.sh -p python -d scannet200 -c semseg-pt-v3m1-0-gfspretrain -n ${EXP_NAME} -g 4
-  ```
-
-> Replace `-d scannet200` with `scannet` or `scannetpp` when training on those datasets.
-
-### 2. Registration Training
-
-- Set the configuration file (`-c`) to:
-  - `semseg-pt-v3m1-0-gfsregistrain_k1.yaml` for 1-shot registration.
-  - `semseg-pt-v3m1-0-gfsregistrain_k5.yaml` for 5-shot registration.
-
-- Download the pretrained 3D VLM weights from [Regionplc repo](https://connecthkuhk-my.sharepoint.com/personal/jhyang13_connect_hku_hk/_layouts/15/onedrive.aspx?id=%2Fpersonal%2Fjhyang13%5Fconnect%5Fhku%5Fhk%2FDocuments%2Fpretrained%5Fmodels%2Fregionplc%2Fpretrained%5Fmodels%2Fsem%5Fseg%2Fscannet%5Fannotation%5Ffree%2Fsparseunet32%5F636%2Epth&parent=%2Fpersonal%2Fjhyang13%5Fconnect%5Fhku%5Fhk%2FDocuments%2Fpretrained%5Fmodels%2Fregionplc%2Fpretrained%5Fmodels%2Fsem%5Fseg%2Fscannet%5Fannotation%5Ffree&ga=1) or [our Huggingface repo](https://huggingface.co/ZhaochongAn/GFS_VL/tree/main/3d_vlm_weight).
-- Update the config file by setting (`-o`):
-  - `vlm_3d_weight`: path to the pretrained VLM weight.
-  - `backbone_weight`: path from Backbone Pretraining.
-  - `data_root`: corresponding dataset folder.
-
-The `regis_train_list` field controls the registration sets to use (By default, training is performed on five different sets; the final performance is reported as an average).
-
-For example, for ScanNet200 (1-shot):
-```bash
-sh scripts/train.sh -p python -d scannet200 -c semseg-pt-v3m1-0-gfsregistrain_k1 -n ${EXP_NAME} -g 4
-```
-> Replace `-d scannet200` with `scannet` or `scannetpp` when training on those datasets.
-
-## 📊 Evaluation & Visualization
-
-###  Evaluation
-By default, five fine-tuned weights (from five registration sets) are saved. To evaluate a specific weight, use the `-w` option:
+Run with:
 
 ```bash
-sh scripts/test.sh -p python -d scannet -c semseg-pt-v3m1-0-gfsregistrain_k1 -n ${EXP_NAME} -w regis1_model_last -g 4
+GPU_LIST=0,3,5 \
+bash scripts/run_scannetpp_k1_direction_ablation.sh
 ```
 
-> **Note**: Our evaluation is performed on whole scenes (unlike prior evaluations only on small blocks) to better simulate real-world scenarios.
+### LSL Post-hoc Evaluation
 
+```bash
+bash scripts/run_split_phase2_lsl_posthoc_eval.sh
+```
 
-### Visualization
+Typical geometry diagnostics include:
 
-Add `-o vis VISUALIZATION_SAVE_PATH` to the evaluation command to automatically save files for visualization. Then, follow the [COSeg visualization guide](https://github.com/ZhaochongAn/COSeg?tab=readme-ov-file#visualization) for high-quality visualization results.
+- Tangent Alignment Score (TAS)
+- geometric discrimination gap
+- explained variation ratio
+- mean principal angle
 
+### Virtual Sample Ablation
 
-## 🎯 Model Zoo
+```bash
+bash scripts/run_phase3_virtual_samples_ablation.sh
+```
 
-| Model | Dataset | K-shot | Weights |
-|:-------:|:---------:|:------------:|:----------:|
-| sc_k1 | ScanNet | 1-shot | [Download](https://huggingface.co/ZhaochongAn/GFS_VL/tree/main/sc_k1) |
-| sc_k5 | ScanNet | 5-shot | [Download](https://huggingface.co/ZhaochongAn/GFS_VL/tree/main/sc_k5) |
-| sc200_k1 | ScanNet200 | 1-shot | [Download](https://huggingface.co/ZhaochongAn/GFS_VL/tree/main/sc200_k1) |
-| sc200_k5 | ScanNet200 | 5-shot | [Download](https://huggingface.co/ZhaochongAn/GFS_VL/tree/main/sc200_k5) |
-| scpp_k1 | ScanNet++ | 1-shot | [Download](https://huggingface.co/ZhaochongAn/GFS_VL/tree/main/scpp_k1) |
-| scpp_k5 | ScanNet++ | 5-shot | [Download](https://huggingface.co/ZhaochongAn/GFS_VL/tree/main/scpp_k5) |
+---
 
+## Point/Text Feature-Space Analysis
+
+The repository includes UMAP/t-SNE utilities for comparing the raw Point Encoder feature space with frozen CLIP text semantics.
+
+```bash
+GPU=4 bash scripts/run_scannetpp_point_text_umap.sh
+```
+
+Run both UMAP and t-SNE:
+
+```bash
+METHOD=both GPU=4 \
+bash scripts/run_scannetpp_point_text_umap.sh
+```
+
+Outputs are written to:
+
+```text
+exp/scannetpp/feature_space_separability/
+```
+
+The analysis includes Point Encoder features, class centroids, CLIP text prototypes, quantitative cosine-distance statistics, and dimensionality-reduction visualizations.
+
+---
+
+## Feature Export and Visualization
+
+### Export Phase-3 Feature Pairs
+
+```bash
+GPU=4 \
+bash scripts/export_scannetpp_split_phase3_k1_regis3_features.sh
+```
+
+The exported cache contains real support features, labels, virtual features, directions, scene IDs, and point IDs.
+
+### Four-Panel Segmentation Visualization
+
+The visualization utilities are under:
+
+```text
+visilization/
+```
+
+They support synchronized views of:
+
+```text
+Input | GFS-VL | PointSLA (Ours) | Ground Truth
+```
+
+---
+
+## Data Preparation
+
+This project follows the Pointcept data format.
+
+### ScanNet / ScanNet200
+
+Download ScanNet v2 and preprocess it with the existing Pointcept preprocessing pipeline.
+
+### ScanNet++
+
+Download ScanNet++ and preprocess it using:
+
+```bash
+python pointcept/datasets/preprocessing/scannetpp/preprocess_scannetpp.py \
+  --dataset_root ${RAW_SCANNETPP_DIR} \
+  --output_root ${PROCESSED_SCANNETPP_DIR} \
+  --num_workers ${NUM_WORKERS}
+```
+
+For training splits, create sampled/chunked scenes with:
+
+```bash
+python pointcept/datasets/preprocessing/sampling_chunking_data.py \
+  --dataset_root ${PROCESSED_SCANNETPP_DIR} \
+  --grid_size 0.01 \
+  --chunk_range 6 6 \
+  --chunk_stride 3 3 \
+  --split train \
+  --num_workers ${NUM_WORKERS}
+```
+
+By default the ScanNet++ experiments expect:
+
+```text
+data/ScanNetpp
+```
+
+---
+
+## Environment
+
+The project is based on Pointcept/PTv3 and the original GFS-VL codebase. A typical environment requires:
+
+- Python 3.10+
+- PyTorch 2.x
+- CUDA 12.x or a compatible CUDA/PyTorch stack
+- Pointcept dependencies
+- OpenAI CLIP / frozen text embeddings
+- pointops / pointops2
+
+For dimensionality-reduction visualization:
+
+```bash
+pip install umap-learn scikit-learn matplotlib
+```
+
+---
+
+## Repository Structure
+
+```text
+configs/
+  scannet/
+  scannet200/
+  scannetpp/
+
+pointcept/models/
+  cdc_base_geometry.py
+  tangent_cdc_base_geometry.py
+  semantic_tangent_cdc_base_geometry.py
+  boundary_semantic_tangent_cdc_base_geometry.py
+  stage2_phase2_cdc_adapt.py
+  stage2_phase3_cdc_aug.py
+
+scripts/
+  run_scannet_cdc_full_pipeline.sh
+  run_scannet200_cdc_full_pipeline.sh
+  run_scannetpp_cdc_full_pipeline.sh
+  run_scannetpp_k1_direction_ablation.sh
+  run_split_phase2_lsl_posthoc_eval.sh
+  run_phase3_virtual_samples_ablation.sh
+  run_scannetpp_point_text_umap.sh
+
+tools/
+  eval_phase2_lsl_metrics.py
+  export_phase3_feature_pairs.py
+  visualize_point_text_feature_space.py
+
+visilization/
+```
+
+---
+
+## Notes on Naming
+
+The current research code evolved from an earlier CDC-based implementation. For backward compatibility, several modules and scripts still contain `cdc` in their file names.
+
+In the current PointSLA formulation:
+
+- `CDC / tangent predictor` corresponds to **Local Subspace Learning (LSL)**
+- semantic projector + conservative radius estimation corresponds to **Semantic Scale Calibration (SSC)**
+- Phase-3 feature synthesis corresponds to **subspace-guided virtual feature augmentation**
+
+---
 
 ## Acknowledgement
 
-This repository is developed by [Zhaochong An](https://zhaochongan.github.io/) and builds upon the excellent works of [COSeg](https://github.com/ZhaochongAn/COSeg), [Pointcept](https://github.com/Pointcept/Pointcept), [RegionPLC](https://github.com/CVMI-Lab/PLA/tree/regionplc), and [Openscene](https://github.com/pengsongyou/openscene). Many thanks to all contributors!
+This repository is built upon the original **GFS-VL: Generalized Few-shot 3D Point Cloud Segmentation with Vision-Language Model** implementation and the excellent open-source projects Pointcept, PTv3, RegionPLC/PLA, OpenScene, and COSeg.
 
-For questions or issues, feel free to reach out:
+We thank the authors of these projects for making their code and benchmarks publicly available.
 
-- **Email:** anzhaochong@outlook.com
-- **Join our Communication Group (WeChat):**
+Original GFS-VL reference:
 
-<div style="text-align: left;">
-    <img src="https://files.mdnice.com/user/67517/068822c4-cece-4ac5-b1db-5c138a91a718.png" width="200"/>
-</div>
+```bibtex
+@inproceedings{an2025generalized,
+  title={Generalized Few-Shot 3D Point Cloud Segmentation with Vision-Language Model},
+  author={An, Zhaochong and Sun, Guolei and Liu, Yun and Li, Runjia and Han, Junlin and Konukoglu, Ender and Belongie, Serge},
+  booktitle={IEEE/CVF Conference on Computer Vision and Pattern Recognition},
+  year={2025}
+}
+```
+
+---
+
+## Citation
+
+The PointSLA citation will be added after the paper metadata is finalized.
