@@ -25,16 +25,23 @@ jobs:
       - name: Install PDF renderer
         run: |
           sudo apt-get update
-          sudo apt-get install -y poppler-utils
+          sudo apt-get install -y poppler-utils pngquant
 
       - name: Render first page of README figures
         run: |
-          pdftoppm -png -singlefile -r 200 \
+          pdftoppm -png -singlefile -r 120 \
             visilization/results/main_vis.pdf \
             visilization/results/main_vis
-          pdftoppm -png -singlefile -r 200 \
+          pdftoppm -png -singlefile -r 120 \
             visilization/results/results_vis.pdf \
             visilization/results/results_vis
+
+          pngquant --quality=75-90 --speed 1 --force \
+            --output visilization/results/main_vis.png \
+            visilization/results/main_vis.png
+          pngquant --quality=75-90 --speed 1 --force \
+            --output visilization/results/results_vis.png \
+            visilization/results/results_vis.png
 
       - name: Commit rendered previews
         run: |
