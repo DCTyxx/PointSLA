@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# One-click ScanNet CDC pipeline:
-#   Stage 1: Base-only CDC geometry learning (shared by K=1 and K=5)
+# One-click ScanNet PointSLA pipeline:
+#   Stage 1: Base-only LSL/CDC geometry learning (shared by K=1 and K=5)
 #   Stage 2 Phase 1: independently adapt PTv3 + Base/Novel heads per registration
-#                    while freezing the Stage-1 CDC stack
-#   Stage 2 Phase 2: freeze task model and fine-tune CDC per registration
-#   Stage 2 Phase 3: freeze PTv3/CDC/Base head and refine Novel head using
-#                    CDC-generated virtual Novel features
+#                    while freezing the Stage-1 PointSLA geometry stack
+#   Stage 2 Phase 2: freeze task model and fine-tune LSL/CDC per registration
+#   Stage 2 Phase 3: freeze PTv3/LSL-CDC/Base head and refine Novel head using
+#                    PointSLA subspace-guided virtual Novel features
 #
 # K=1 and K=5 both use regis1..regis5 with seeds 10,20,30,40,50.
 # Every registration is launched in a fresh process so no model/optimizer state
@@ -357,7 +357,7 @@ done
 
 echo ""
 echo "===================================================================="
-echo "ScanNet CDC pipeline completed: Stage1 + K1/K5 Phase1/2/3"
+echo "ScanNet PointSLA pipeline completed: Stage1 + K1/K5 Phase1/2/3"
 echo "Stage-1: ${STAGE1_CKPT}"
 echo "Phase-3 radius: ${RESOLVED_RADIUS}"
 echo "K=1 summary: ./exp/${DATASET}/stage2_phase3_k1_cdc/phase3_metrics_summary.json"
