@@ -1,0 +1,49 @@
+name: Render README figures
+
+on:
+  push:
+    branches:
+      - feature/cdc-base-geometry-step1
+    paths:
+      - 'visilization/results/main_vis.pdf'
+      - 'visilization/results/results_vis.pdf'
+      - '.github/workflows/render-readme-figures.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: feature/cdc-base-geometry-step1
+
+      - name: Install PDF renderer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y poppler-utils
+
+      - name: Render first page of README figures
+        run: |
+          pdftoppm -png -singlefile -r 200 \
+            visilization/results/main_vis.pdf \
+            visilization/results/main_vis
+          pdftoppm -png -singlefile -r 200 \
+            visilization/results/results_vis.pdf \
+            visilization/results/results_vis
+
+      - name: Commit rendered previews
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add visilization/results/main_vis.png visilization/results/results_vis.png
+          if git diff --cached --quiet; then
+            echo "No preview changes to commit."
+            exit 0
+          fi
+          git commit -m "Render README figure previews"
+          git push origin HEAD:feature/cdc-base-geometry-step1
