@@ -37,10 +37,15 @@ jobs:
             visilization/results/results_vis
 
           pngquant --quality=75-90 --speed 1 --force \
-            --output visilization/results/main_vis.png \
+            --output visilization/results/main_vis.quant.png \
             visilization/results/main_vis.png
+          mv visilization/results/main_vis.quant.png \
+            visilization/results/main_vis.png
+
           pngquant --quality=75-90 --speed 1 --force \
-            --output visilization/results/results_vis.png \
+            --output visilization/results/results_vis.quant.png \
+            visilization/results/results_vis.png
+          mv visilization/results/results_vis.quant.png \
             visilization/results/results_vis.png
 
       - name: Commit rendered previews
