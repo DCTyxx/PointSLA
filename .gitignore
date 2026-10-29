@@ -17,3 +17,6 @@ Dockerfile
 venv/
 output
 version.py
+pres_exp
+pretrain_weights
+data
