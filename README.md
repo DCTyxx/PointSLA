@@ -13,11 +13,19 @@ Our key idea is to improve the coverage of sparse novel-class features. PointSLA
 
 ### Main Pipeline
 
-[**View the PointSLA main pipeline (PDF)**](./visilization/results/main_vis.pdf)
+<p align="center">
+  <a href="./visilization/results/main_vis.pdf">
+    <img src="./visilization/results/main_vis.png" width="100%" alt="PointSLA main pipeline">
+  </a>
+</p>
 
 ### Qualitative Results
 
-[**View qualitative segmentation results (PDF)**](./visilization/results/results_vis.pdf)
+<p align="center">
+  <a href="./visilization/results/results_vis.pdf">
+    <img src="./visilization/results/results_vis.png" width="100%" alt="PointSLA qualitative results">
+  </a>
+</p>
 
 The qualitative comparison follows:
 
@@ -51,7 +59,7 @@ The implementation follows three stages:
 For ScanNet++:
 
 ```bash
-GPU_LIST=0,3,5 bash scripts/run_scannetpp_cdc_full_pipeline.sh
+bash scripts/run_scannetpp_cdc_full_pipeline.sh
 ```
 
 Equivalent full-pipeline scripts are also provided for ScanNet and ScanNet200.
@@ -81,13 +89,13 @@ Equivalent full-pipeline scripts are also provided for ScanNet and ScanNet200.
 Point/text feature-space analysis:
 
 ```bash
-GPU=4 bash scripts/run_scannetpp_point_text_umap.sh
+bash scripts/run_scannetpp_point_text_umap.sh
 ```
 
 Run both UMAP and t-SNE:
 
 ```bash
-METHOD=both GPU=4 bash scripts/run_scannetpp_point_text_umap.sh
+METHOD=both bash scripts/run_scannetpp_point_text_umap.sh
 ```
 
 Feature-pair export and segmentation visualization utilities are available under:
